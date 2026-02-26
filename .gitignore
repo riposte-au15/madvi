@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Langflow local stuff (if any)
+langflow.db
+*.log
+
+# Chroma / Vector DB (DO NOT COMMIT)
+chroma_store/
+madrigal_html/
+*.sqlite3
+*.bin
+
+# Data files you don’t want public (optional)
+data/
+*.pdf
+
+# Secrets
+.env
+.env.*
