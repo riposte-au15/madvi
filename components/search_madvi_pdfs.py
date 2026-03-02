@@ -15,9 +15,8 @@ class SearchMadviPDFs(Component):
     name = "search_madvi_pdfs"
     trace_type = "tool"
 
-    # ---- CONFIG (edit only if your paths/names differ) ----
-    PERSIST_DIR = "./MadVagentZ"
-    COLLECTION = "MadVagentZ"
+    PERSIST_DIR = "./madrigal_pdfs"
+    COLLECTION = "madrigal_pdfs
 
     # ---- Anti-loop / stability settings ----
     TOP_K = 3
