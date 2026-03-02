@@ -15,9 +15,8 @@ class SearchMadrigalDocs(Component):
     name = "search_madrigal_docs"
     trace_type = "tool"
 
-    # ---- CONFIG (edit only if your paths/names differ) ----
-    PERSIST_DIR = "./madrigal_html"      # folder where your Chroma DB persists
-    COLLECTION = "madrigal_html"        # collection name inside that persist dir
+    PERSIST_DIR = "./madrigal_web_docs"      # folder where your Chroma DB persists
+    COLLECTION = "madrigal_web_docs"        # collection name inside that persist dir
 
     # ---- Anti-loop / stability settings ----
     TOP_K = 3
