@@ -1,0 +1,3075 @@
+from typing import Dict, List, Tuple, Optional
+import re
+import sqlite3
+import html
+import calendar
+import os
+from datetime import datetime, timedelta
+
+import chromadb
+from langchain_openai import OpenAIEmbeddings
+from madrigalWeb.madrigalWeb import MadrigalData
+
+from langflow.custom.custom_component.component import Component
+from langflow.io import MessageTextInput, Output, SecretStrInput, BoolInput
+from langflow.schema.message import Message
+
+
+DEFAULT_MADRIGAL_URL = "https://cedar.openmadrigal.org/"
+
+
+def _to_text(x) -> str:
+    if isinstance(x, Message):
+        return x.text or ""
+    return str(x or "")
+
+
+def _secret_to_text(x) -> str:
+    if hasattr(x, "get_secret_value"):
+        return x.get_secret_value()
+    return _to_text(x)
+
+
+def _clean_space(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _norm(text: str) -> str:
+    return _clean_space(text).lower()
+
+
+def _contains_any(q: str, terms: List[str]) -> bool:
+    return any(t in q for t in terms)
+
+
+def _extract_limit(query: str, default_limit: int = 15) -> int:
+    m = re.search(r"\btop\s+(\d+)\b", query.lower())
+    if m:
+        try:
+            return max(1, min(500, int(m.group(1))))
+        except Exception:
+            pass
+    return default_limit
+
+
+def _extract_year(query: str) -> Optional[str]:
+    m = re.search(r"\b(20\d{2}|19\d{2})\b", query or "")
+    return m.group(1) if m else None
+
+
+
+
+MONTH_NAME_TO_NUMBER: Dict[str, int] = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+def _iso_utc(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _strip_ordinal_suffixes(text: str) -> str:
+    return re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", text or "", flags=re.I)
+
+
+def _parse_flexible_date(value: str) -> Optional[datetime]:
+    """
+    Parse one calendar date without inventing a timezone.
+    Returned datetimes are naive UTC calendar boundaries.
+    """
+    value = _strip_ordinal_suffixes(value or "")
+    value = re.sub(r"\s+", " ", value.strip().strip(",.;"))
+
+    if not value:
+        return None
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _extract_sql_time_window(query: str) -> Optional[Dict[str, str]]:
+    """
+    Convert a user time expression into an inclusive-start/exclusive-end UTC window.
+
+    Supported examples:
+      - 2019
+      - August 2019 / Aug 2019
+      - 2019-08
+      - 2019-08-01
+      - 08/01/2019
+      - from 2019-08-01 to 2019-08-31
+      - between August 1 and August 31, 2019
+    """
+    raw = _strip_ordinal_suffixes(query or "")
+    q = _norm(raw)
+
+    # Defensive local month map.
+    # Langflow may compile helper functions in an isolated namespace after a
+    # custom-component edit, which can make module-level constants unavailable
+    # even when they are present in the source. Keeping this mapping local
+    # prevents NameError: MONTH_NAME_TO_NUMBER is not defined.
+    month_name_to_number = {
+        "january": 1, "jan": 1,
+        "february": 2, "feb": 2,
+        "march": 3, "mar": 3,
+        "april": 4, "apr": 4,
+        "may": 5,
+        "june": 6, "jun": 6,
+        "july": 7, "jul": 7,
+        "august": 8, "aug": 8,
+        "september": 9, "sep": 9, "sept": 9,
+        "october": 10, "oct": 10,
+        "november": 11, "nov": 11,
+        "december": 12, "dec": 12,
+    }
+
+    # Explicit ISO or slash-form date pairs.
+    date_tokens = re.findall(
+        r"\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b"
+        r"|\b\d{1,2}/\d{1,2}/(?:19|20)\d{2}\b",
+        raw,
+        flags=re.I,
+    )
+
+    if len(date_tokens) >= 2:
+        start_dt = _parse_flexible_date(date_tokens[0])
+        end_dt = _parse_flexible_date(date_tokens[1])
+        if start_dt and end_dt:
+            if end_dt < start_dt:
+                start_dt, end_dt = end_dt, start_dt
+            end_exclusive = end_dt + timedelta(days=1)
+            return {
+                "start": _iso_utc(start_dt),
+                "end": _iso_utc(end_exclusive),
+                "label": f"{start_dt:%Y-%m-%d} through {end_dt:%Y-%m-%d}",
+                "granularity": "date_range",
+            }
+
+    # Two full month-name dates, each carrying its own year.
+    month_date_pattern = (
+        r"\b(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december|jan|feb|mar|apr|jun|jul|"
+        r"aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,\s*|\s+)(?:19|20)\d{2}\b"
+    )
+    named_dates = re.findall(month_date_pattern, raw, flags=re.I)
+    if len(named_dates) >= 2:
+        start_dt = _parse_flexible_date(named_dates[0])
+        end_dt = _parse_flexible_date(named_dates[1])
+        if start_dt and end_dt:
+            if end_dt < start_dt:
+                start_dt, end_dt = end_dt, start_dt
+            end_exclusive = end_dt + timedelta(days=1)
+            return {
+                "start": _iso_utc(start_dt),
+                "end": _iso_utc(end_exclusive),
+                "label": f"{start_dt:%Y-%m-%d} through {end_dt:%Y-%m-%d}",
+                "granularity": "date_range",
+            }
+
+    # Same-month or cross-month phrase where the year appears once:
+    # "between August 1 and August 31, 2019"
+    m = re.search(
+        r"\b(?:from|between)\s+"
+        r"(january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2})\s+"
+        r"(?:to|through|until|and|-)\s+"
+        r"(?:(january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+)?"
+        r"(\d{1,2})(?:,\s*|\s+)((?:19|20)\d{2})\b",
+        raw,
+        flags=re.I,
+    )
+    if m:
+        month1 = month_name_to_number[m.group(1).lower()]
+        month2 = month_name_to_number[(m.group(3) or m.group(1)).lower()]
+        year = int(m.group(5))
+        try:
+            start_dt = datetime(year, month1, int(m.group(2)))
+            end_dt = datetime(year, month2, int(m.group(4)))
+            if end_dt < start_dt:
+                start_dt, end_dt = end_dt, start_dt
+            return {
+                "start": _iso_utc(start_dt),
+                "end": _iso_utc(end_dt + timedelta(days=1)),
+                "label": f"{start_dt:%Y-%m-%d} through {end_dt:%Y-%m-%d}",
+                "granularity": "date_range",
+            }
+        except ValueError:
+            pass
+
+    # One exact date means one UTC calendar day.
+    if len(date_tokens) == 1:
+        day = _parse_flexible_date(date_tokens[0])
+        if day:
+            return {
+                "start": _iso_utc(day),
+                "end": _iso_utc(day + timedelta(days=1)),
+                "label": f"{day:%Y-%m-%d}",
+                "granularity": "day",
+            }
+
+    if len(named_dates) == 1:
+        day = _parse_flexible_date(named_dates[0])
+        if day:
+            return {
+                "start": _iso_utc(day),
+                "end": _iso_utc(day + timedelta(days=1)),
+                "label": f"{day:%Y-%m-%d}",
+                "granularity": "day",
+            }
+
+    # Numeric year-month, e.g. 2019-08.
+    m = re.search(r"\b((?:19|20)\d{2})[-/](0?[1-9]|1[0-2])\b", raw)
+    if m:
+        year = int(m.group(1))
+        month = int(m.group(2))
+        start_dt = datetime(year, month, 1)
+        if month == 12:
+            end_dt = datetime(year + 1, 1, 1)
+        else:
+            end_dt = datetime(year, month + 1, 1)
+        return {
+            "start": _iso_utc(start_dt),
+            "end": _iso_utc(end_dt),
+            "label": f"{calendar.month_name[month]} {year}",
+            "granularity": "month",
+        }
+
+    # Month name + year, e.g. August 2019.
+    m = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(?:of\s+)?((?:19|20)\d{2})\b",
+        q,
+        flags=re.I,
+    )
+    if m:
+        month = month_name_to_number[m.group(1).lower()]
+        year = int(m.group(2))
+        start_dt = datetime(year, month, 1)
+        if month == 12:
+            end_dt = datetime(year + 1, 1, 1)
+        else:
+            end_dt = datetime(year, month + 1, 1)
+        return {
+            "start": _iso_utc(start_dt),
+            "end": _iso_utc(end_dt),
+            "label": f"{calendar.month_name[month]} {year}",
+            "granularity": "month",
+        }
+
+    # Full year fallback.
+    m = re.search(r"\b((?:19|20)\d{2})\b", raw)
+    if m:
+        year = int(m.group(1))
+        return {
+            "start": _iso_utc(datetime(year, 1, 1)),
+            "end": _iso_utc(datetime(year + 1, 1, 1)),
+            "label": str(year),
+            "granularity": "year",
+        }
+
+    return None
+
+
+def _availability_metric(query: str) -> Optional[str]:
+    q = _norm(query)
+
+    if (
+        "how many days" in q
+        or "distinct days" in q
+        or "days with" in q
+        or "days of" in q
+        or "days are available" in q
+    ):
+        return "days"
+
+    if (
+        "how many files" in q
+        or "number of files" in q
+        or "file count" in q
+        or "count of files" in q
+    ):
+        return "files"
+
+    if "how many measurements" in q or "number of measurements" in q:
+        return "measurements"
+
+    return None
+
+
+def _detect_availability_product(query: str) -> Optional[Dict[str, object]]:
+    """
+    Resolve beginner-facing science language into deterministic header-metadata matches.
+    Error/uncertainty mnemonics are deliberately not included.
+    Hyphenated natural-language forms are normalized (for example electron-density).
+    """
+    q = _norm(query).replace("-", " ")
+
+    if "electron density" in q or re.search(r"\bne\b", q) or re.search(r"\bnel\b", q):
+        return {
+            "label": "electron density",
+            "codes": ["NE", "NEL"],
+            "description_terms": ["electron density"],
+        }
+
+    if (
+        "isr drift" in q
+        or "isr drifts" in q
+        or "ion drift" in q
+        or "ion drifts" in q
+        or "line of sight velocity" in q
+        or "line-of-sight velocity" in q
+        or "line of sight ion velocity" in q
+        or "los velocity" in q
+        or re.search(r"\bvo\b", q)
+        or ("drift" in q and ("isr" in q or "radar" in q or "incoherent scatter" in q))
+    ):
+        return {
+            "label": "ISR drift / line-of-sight ion velocity",
+            "codes": ["VO"],
+            "description_terms": ["line of sight ion velocity"],
+        }
+
+    if "ion temperature" in q or re.search(r"\bti\b", q):
+        return {
+            "label": "ion temperature",
+            "codes": ["TI"],
+            "description_terms": ["ion temperature"],
+        }
+
+    if "electron temperature" in q or re.search(r"\bte\b", q):
+        return {
+            "label": "electron temperature",
+            "codes": ["TE"],
+            "description_terms": ["electron temperature"],
+        }
+
+    if "neutral wind" in q or re.search(r"\bvn1\b|\bvn2\b|\bvn31\b", q):
+        return {
+            "label": "neutral wind",
+            "codes": ["VN1", "VN2", "VN31"],
+            "description_terms": ["neutral wind"],
+        }
+
+    if "total electron content" in q or re.search(r"\btec\b", q):
+        return {
+            "label": "total electron content",
+            "codes": ["TEC"],
+            "description_terms": ["total electron content"],
+        }
+
+    if "geodetic altitude" in q or re.search(r"\bgdalt\b", q):
+        return {
+            "label": "geodetic altitude",
+            "codes": ["GDALT"],
+            "description_terms": ["geodetic altitude"],
+        }
+
+    explicit_codes = []
+    for mnemonic in [
+        "GDALT", "TI", "TE", "TEC", "NE", "NEL", "POPL", "DPOP",
+        "VO", "VI", "VN1", "VN2", "VN31", "GDLAT", "GDLON",
+        "GLON", "RANGE", "AZM", "ELM", "KP", "DST",
+    ]:
+        if re.search(rf"\b{re.escape(mnemonic.lower())}\b", q):
+            explicit_codes.append(mnemonic)
+
+    if explicit_codes:
+        return {
+            "label": "requested Madrigal parameter(s)",
+            "codes": explicit_codes,
+            "description_terms": [],
+        }
+
+    return None
+
+
+
+def _has_space_weather_terms(query: str) -> bool:
+    """Return True when a query explicitly references supported space-weather concepts."""
+    q = _norm(query)
+    return bool(
+        re.search(r"\bkp\b", q)
+        or re.search(r"\bap\b", q)
+        or "f10.7" in q
+        or "f107" in q
+        or "solar radio flux" in q
+        or "sunspot number" in q
+        or re.search(r"\bsn\b", q)
+        or "space weather" in q
+        or "geomagnetic activity" in q
+        or "geomagnetic conditions" in q
+        or "geomagnetically disturbed" in q
+        or "geomagnetic storm" in q
+        or "storm conditions" in q
+    )
+
+
+def _space_weather_metric(query: str) -> Optional[Dict[str, str]]:
+    """Map user language to an allow-listed daily space-weather column."""
+    q = _norm(query)
+
+    if (
+        "f10.7adj" in q or "f107adj" in q or "f10.7 adj" in q
+        or "f107 adj" in q or "adjusted f10.7" in q or "adjusted f107" in q
+    ):
+        return {"column": "f107_adj", "label": "F10.7 adjusted", "units": "sfu"}
+
+    if "f10.7" in q or "f107" in q or "solar radio flux" in q:
+        return {"column": "f107_obs", "label": "F10.7 observed", "units": "sfu"}
+
+    if "sunspot number" in q or re.search(r"\bsn\b", q):
+        return {"column": "sunspot_number", "label": "sunspot number", "units": "count"}
+
+    if re.search(r"\bap\b", q):
+        if (
+            "max ap" in q or "maximum ap" in q or "ap max" in q
+            or "3-hour ap" in q or "3 hour ap" in q
+            or "three-hour ap" in q or "three hour ap" in q
+        ):
+            return {"column": "ap_max", "label": "maximum 3-hour ap", "units": "index"}
+        return {"column": "ap_daily", "label": "daily Ap", "units": "index"}
+
+    if re.search(r"\bkp\b", q):
+        if "mean kp" in q or "average kp" in q or "avg kp" in q:
+            return {"column": "kp_mean", "label": "mean daily Kp", "units": "index"}
+        return {"column": "kp_max", "label": "maximum 3-hour Kp within the UTC day", "units": "index"}
+
+    return None
+
+
+def _extract_space_weather_conditions(query: str) -> List[Dict[str, object]]:
+    """Extract explicit filters such as Kp >= 5, daily Ap > 30, F10.7obs > 150."""
+    raw = str(query or "")
+    conditions: List[Dict[str, object]] = []
+
+    specs = [
+        ("f107_adj", "F10.7 adjusted", r"(?:f10\.7\s*(?:adj|adjusted)|f107\s*(?:adj|adjusted)|adjusted\s+f10\.7|adjusted\s+f107)"),
+        ("f107_obs", "F10.7 observed", r"(?:f10\.7\s*(?:obs|observed)?|f107\s*(?:obs|observed)?|solar\s+radio\s+flux)"),
+        ("sunspot_number", "sunspot number", r"(?:sunspot\s+number|\bSN\b)"),
+        ("kp_max", "maximum daily Kp", r"\bKp\b"),
+        ("ap_daily", "daily Ap", r"\bAp\b|\bap\b"),
+    ]
+
+    op_words = (
+        r">=|<=|==|=|>|<|"
+        r"at\s+least|at\s+most|"
+        r"greater\s+than\s+or\s+equal\s+to|less\s+than\s+or\s+equal\s+to|"
+        r"greater\s+than|less\s+than|above|over|below|under|equals?|equal\s+to"
+    )
+
+    def normalize_op(op_text: str) -> str:
+        o = _norm(op_text)
+        if o in [">=", "at least", "greater than or equal to"]:
+            return ">="
+        if o in ["<=", "at most", "less than or equal to"]:
+            return "<="
+        if o in [">", "above", "over", "greater than"]:
+            return ">"
+        if o in ["<", "below", "under", "less than"]:
+            return "<"
+        return "="
+
+    seen = set()
+    for column, label, alias_pattern in specs:
+        pattern = (
+            rf"({alias_pattern})"
+            rf"(?:\s+(?:index|value|max|maximum|daily|observed|adjusted|was|is|of))*"
+            rf"\s*({op_words})\s*(-?\d+(?:\.\d+)?)"
+        )
+        m = re.search(pattern, raw, flags=re.I)
+        if not m:
+            continue
+        op = normalize_op(m.group(2))
+        value = float(m.group(3))
+        key = (column, op, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        conditions.append({"column": column, "label": label, "operator": op, "value": value})
+
+    return conditions
+
+
+def _space_weather_condition_sql(
+    conditions: List[Dict[str, object]],
+    alias: str = "sw",
+) -> Tuple[str, Tuple[object, ...]]:
+    """Build a SQL predicate using only allow-listed columns/operators."""
+    allowed_columns = {
+        "kp_max", "kp_mean", "ap_daily", "ap_max",
+        "f107_obs", "f107_adj", "sunspot_number",
+    }
+    allowed_ops = {">", ">=", "<", "<=", "="}
+    clauses = []
+    params: List[object] = []
+
+    for item in conditions:
+        column = str(item.get("column", ""))
+        op = str(item.get("operator", ""))
+        if column not in allowed_columns or op not in allowed_ops:
+            continue
+        clauses.append(f"{alias}.{column} {op} ?")
+        params.append(item.get("value"))
+
+    return " AND ".join(clauses), tuple(params)
+
+
+def _space_weather_intent(query: str) -> str:
+    q = _norm(query)
+    if re.search(r"\b(?:how many|count|number of)\b", q):
+        return "count"
+
+    # Explicit day/date listing language should stay a list even if the user
+    # refers to the day's maximum Kp value.
+    if (
+        "which days" in q or "what days" in q or "list days" in q
+        or "show days" in q or "which dates" in q or "what dates" in q
+        or "list dates" in q or "show dates" in q
+    ):
+        return "list_days"
+
+    # Aggregate-statistic questions get priority over incidental words such as
+    # "days" later in the sentence (e.g. "What was the maximum Kp on ISR days?").
+    if re.search(r"\b(?:what|which)\b.{0,30}\b(?:maximum|max|highest|peak)\b", q):
+        return "max"
+    if re.search(r"\b(?:what|which)\b.{0,30}\b(?:minimum|min|lowest)\b", q):
+        return "min"
+    if re.search(r"\b(?:what|which)\b.{0,30}\b(?:average|mean|avg)\b", q):
+        return "mean"
+
+    if re.search(r"\b(?:which|what|show|list)\b.*\bfiles?\b", q):
+        return "list_files"
+    if bool(re.search(r"\b(?:which|what|list|show)\b.*\b(?:days|dates)\b", q)):
+        return "list_days"
+
+    if re.search(r"\b(?:maximum|max|highest|peak)\b", q):
+        return "max"
+    if re.search(r"\b(?:minimum|min|lowest)\b", q):
+        return "min"
+    if re.search(r"\b(?:average|mean|avg)\b", q):
+        return "mean"
+    if "latest" in q or "most recent" in q:
+        return "latest"
+    return "summary"
+
+def _needs_space_weather_threshold_clarification(query: str) -> bool:
+    q = _norm(query)
+    qualitative = any(x in q for x in [
+        "high geomagnetic activity",
+        "strong geomagnetic activity",
+        "low geomagnetic activity",
+        "geomagnetically disturbed",
+        "disturbed geomagnetic",
+        "geomagnetic storm",
+        "storm conditions",
+        "quiet geomagnetic",
+        "quiet conditions",
+    ])
+    return qualitative and not _extract_space_weather_conditions(query)
+
+# -----------------------------------------------------------------------------
+# Madrigal-only universal scope gate
+# -----------------------------------------------------------------------------
+OUT_OF_SCOPE_RESPONSE = (
+    "[Out of Scope]\n"
+    "OUT_OF_SCOPE\n\n"
+    "MadVI is a domain-specific assistant for the Madrigal scientific data ecosystem. "
+    "I can help with Madrigal data, instruments, parameters, metadata, documentation, "
+    "scientific literature related to Madrigal/geospace research, Madrigal commands and "
+    "citations, and the supported geomagnetic/space-weather context used by MadVI. "
+    "I cannot answer unrelated general-purpose requests."
+)
+
+
+def _is_madrigal_scope_query(query: str) -> bool:
+    """
+    Universal domain boundary for the single-tool MadVI architecture.
+
+    The goal is deliberately broader than the internal routing rules: this function
+    answers only one question -- is the request meaningfully inside MadVI's Madrigal /
+    geospace scientific domain?  If yes, the existing router is left completely in
+    charge of choosing Docs, Papers, SQL, or Citation.
+
+    Important design rule:
+    - Do not add topic-specific OUT-OF-SCOPE deny rules (food, sports, etc.).
+    - Instead, require positive evidence that the query belongs to Madrigal or to one
+      of the scientific concepts/workflows that MadVI actually supports.
+    """
+    q = _norm(query).replace("-", " ")
+    if not q:
+        return False
+
+    # 1) Direct Madrigal / CEDAR ecosystem and supported workflow signals.
+    direct_terms = [
+        "madrigal",
+        "openmadrigal",
+        "cedar database",
+        "cedar madrigal",
+        "madrigalweb",
+        "madrigaldata",
+        "globaldownload",
+        "globalisprint",
+        "globalcitation",
+        "getexperiments",
+        "getexperimentfiles",
+        "insttab",
+        "exptab",
+        "filetab",
+        "parmcodes",
+        "parmcode",
+        "madrigal citation",
+        "citation group",
+        "persistent citation",
+        "citable madrigal",
+    ]
+    if _contains_any(q, direct_terms):
+        return True
+
+    # 2) Madrigal sites / instruments that are explicitly supported by the router.
+    site_and_instrument_terms = [
+        "millstone hill",
+        "jicamarca",
+        "arecibo",
+        "poker flat",
+        "sondrestrom",
+        "fabry perot",
+        "fabry-perot",
+        "incoherent scatter",
+        "is radar",
+        "isr",
+        "dmsp",
+    ]
+    if _contains_any(q, site_and_instrument_terms):
+        return True
+
+    # 3) Scientific concepts represented in the Madrigal / MadVI data and paper
+    #    collections.  These allow natural queries that do not literally say
+    #    "Madrigal", e.g. "find papers about ionospheric electron density".
+    science_terms = [
+        "geospace",
+        "ionosphere",
+        "ionospheric",
+        "thermosphere",
+        "thermospheric",
+        "magnetosphere",
+        "magnetospheric",
+        "geomagnetic",
+        "space weather",
+        "electron density",
+        "electron temperature",
+        "ion temperature",
+        "ion drift",
+        "neutral wind",
+        "total electron content",
+        "traveling ionospheric disturbance",
+        "travelling ionospheric disturbance",
+        "mstid",
+        "mstids",
+        "saps",
+        "substorm",
+        "sar arc",
+        "solar radio flux",
+        "sunspot number",
+    ]
+    if _contains_any(q, science_terms):
+        return True
+
+    # 4) Supported space-weather observables.  These are intentionally accepted even
+    #    without the word Madrigal because space_weather.db is an explicit MadVI data
+    #    source and the current executor already supports standalone and joined queries.
+    if (
+        re.search(r"\bkp\b", q)
+        or re.search(r"\bf10\.?7\b", q)
+        or re.search(r"\bf107\b", q)
+        or re.search(r"\bdst\b", q)
+    ):
+        return True
+
+    # Ap/ap and SN are short/ambiguous tokens, so require surrounding scientific or
+    # data-query language rather than accepting them everywhere.
+    if re.search(r"\bap\b", q) and re.search(
+        r"\b(?:index|geomagnetic|space weather|daily|3 hour|three hour|kp|data|value|values)\b",
+        q,
+    ):
+        return True
+    if re.search(r"\bsn\b", q) and re.search(
+        r"\b(?:sunspot|solar|space weather|data|value|values)\b",
+        q,
+    ):
+        return True
+
+    # 5) Madrigal parameter mnemonics.  Longer/specific mnemonics are safe enough to
+    #    accept directly.  Very short mnemonics are accepted only when the surrounding
+    #    query looks like a scientific metadata/data request.
+    specific_mnemonics = [
+        "gdalt", "gdlat", "gdlon", "glon", "range", "azm", "elm",
+        "popl", "dpop", "vn1", "vn2", "vn31", "tec",
+    ]
+    if any(re.search(rf"\b{re.escape(m)}\b", q) for m in specific_mnemonics):
+        return True
+
+    short_mnemonic = bool(re.search(r"\b(?:ne|nel|ti|te|vo|vi)\b", q))
+    metadata_context = bool(re.search(
+        r"\b(?:parameter|parameters|mnemonic|mnemonics|data|file|files|dataset|datasets|"
+        r"measurement|measurements|instrument|instruments|available|availability|coverage|"
+        r"definition|definitions|units?|days?|records?|radar)\b",
+        q,
+    ))
+    if short_mnemonic and metadata_context:
+        return True
+
+    # 6) Explicit Madrigal-style instrument IDs used together with data/metadata language.
+    if _extract_explicit_instrument_ids(query) and metadata_context:
+        return True
+
+    # No positive Madrigal/geospace signal: reject instead of falling through to the
+    # generic documentation route.  This is what blocks unrelated prompts such as
+    # recipes, sports, travel, coding questions unrelated to Madrigal, etc.
+    return False
+
+
+def _extract_email(text: str) -> str:
+    m = re.search(r"[\w\.\-+]+@[\w\.\-]+\.\w+", text or "")
+    return m.group(0) if m else ""
+
+
+def _normalize_url(url: str) -> str:
+    url = (url or DEFAULT_MADRIGAL_URL).strip().strip('"').strip("'")
+    m = re.search(r"https?://[^\s\"']+", url)
+    if m:
+        url = m.group(0)
+    url = re.sub(r"(https?://[^/]+)(/.*)?$", r"\1/", url)
+    if not url.endswith("/"):
+        url += "/"
+    return url
+
+
+def _is_citation_action_query(query: str) -> bool:
+    q = _norm(query)
+
+    has_citation = any(x in q for x in [
+        "madrigal citation",
+        "citation group",
+        "persistent citation",
+        "permanent citation",
+        "citable madrigal",
+        "citable url",
+    ])
+
+    has_action = any(x in q for x in [
+        "create",
+        "make",
+        "generate",
+        "build",
+        "dry run",
+        "dry-run",
+        "real citation",
+        "not a dry run",
+        "not dry run",
+        "not dry-run",
+        "actually create",
+        "permanent",
+    ])
+
+    has_dates = bool(re.search(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b", q))
+
+    return has_citation and has_action and has_dates
+
+
+def _parse_dates(query: str) -> Tuple[Optional[str], Optional[str]]:
+    q = query or ""
+
+    m = re.search(
+        r"from\s+(\d{4}-\d{2}-\d{2})\s+(?:to|through|until|-)\s+(\d{4}-\d{2}-\d{2})",
+        q,
+        flags=re.I,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    dates = [m.group(0) for m in re.finditer(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b", q)]
+    if len(dates) >= 2:
+        return dates[0], dates[1]
+
+    return None, None
+
+
+def _parse_date(s: str) -> datetime:
+    return datetime.strptime((s or "").strip(), "%Y-%m-%d")
+
+
+def _extract_explicit_instrument_ids(text: str) -> List[int]:
+    patterns = [
+        r"\binstrument\s*id\s*[:=]?\s*(\d{1,6})\b",
+        r"\binstrument\s*[:=]?\s*(\d{1,6})\b",
+        r"\binst\s*[:=]?\s*(\d{1,6})\b",
+        r"\bkinst\s*[:=]?\s*(\d{1,6})\b",
+    ]
+
+    ids = []
+    for pat in patterns:
+        for m in re.finditer(pat, text or "", flags=re.I):
+            val = int(m.group(1))
+            if val not in ids:
+                ids.append(val)
+
+    return ids
+
+
+def _extract_instrument_text(query: str) -> str:
+    q = query or ""
+
+    ids = _extract_explicit_instrument_ids(q)
+    if ids:
+        return ",".join(str(x) for x in ids)
+
+    patterns = [
+        r"citation\s+for\s+(.+?)\s+data\s+from\s+\d{4}-\d{2}-\d{2}",
+        r"citation\s+for\s+(.+?)\s+from\s+\d{4}-\d{2}-\d{2}",
+        r"for\s+(.+?)\s+data\s+from\s+\d{4}-\d{2}-\d{2}",
+        r"instrument\s*[:=]\s*(.+?)(?:;|,|from\s+\d{4}-\d{2}-\d{2}|$)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, q, flags=re.I)
+        if m:
+            val = _clean_space(m.group(1))
+            val = re.sub(r"\bdata\b$", "", val, flags=re.I).strip()
+            return val
+
+    return ""
+
+
+def _parse_identity(query: str) -> Tuple[str, str, str]:
+    email = _extract_email(query)
+
+    fullname = ""
+    affiliation = ""
+
+    m = re.search(r"user\s+full\s+name\s*[:=]\s*([^;,\n]+)", query, flags=re.I)
+    if m:
+        fullname = _clean_space(m.group(1))
+
+    m = re.search(r"name\s*[:=]\s*([^;,\n]+)", query, flags=re.I)
+    if not fullname and m:
+        fullname = _clean_space(m.group(1))
+
+    m = re.search(r"affiliation\s*[:=]\s*([^;,\n]+)", query, flags=re.I)
+    if m:
+        affiliation = _clean_space(m.group(1))
+
+    if (not fullname or not affiliation) and "use " in _norm(query):
+        m = re.search(r"use\s+(.+)", query, flags=re.I)
+        if m:
+            tail = m.group(1)
+            tail = re.sub(r"\bdry[-\s]?run\b.*", "", tail, flags=re.I).strip(" .;")
+            parts = [p.strip(" .;") for p in tail.split(",") if p.strip()]
+            if len(parts) >= 1 and not fullname:
+                fullname = parts[0]
+            if len(parts) >= 3 and not affiliation:
+                affiliation = parts[2]
+
+    if not fullname:
+        fullname = "Unknown User"
+    if not email:
+        email = "unknown@example.com"
+    if not affiliation:
+        affiliation = "Unknown"
+
+    return fullname, email, affiliation
+
+
+def _valid_citation(c: str) -> bool:
+    if not isinstance(c, str):
+        return False
+
+    c = c.strip()
+    if not c:
+        return False
+
+    bad = ["no citations found", "no group citation created", "error", "illegal url"]
+    if any(x in c.lower() for x in bad):
+        return False
+
+    return (
+        c.startswith("https://w3id.org/cedar?")
+        or c.startswith("experiments/")
+        or c.startswith("experiments5/")
+    )
+
+
+def _extract_inst(inst) -> Tuple[Optional[int], Optional[str]]:
+    code = getattr(inst, "code", None)
+    name = getattr(inst, "name", None)
+
+    if code is not None and name is not None:
+        try:
+            return int(code), str(name)
+        except Exception:
+            pass
+
+    try:
+        return int(inst[0]), str(inst[1])
+    except Exception:
+        return None, None
+
+
+def _tokens(s: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
+
+def _resolve_instruments(md: MadrigalData, instrument_raw: str) -> Tuple[List[int], List[str]]:
+    raw = _clean_space(instrument_raw)
+
+    if not raw:
+        raise ValueError("Missing instrument. Example: instrument 30 or Millstone Hill IS Radar.")
+
+    ids = _extract_explicit_instrument_ids(raw)
+    if ids:
+        return ids, [f"explicit numeric instrument id {x}" for x in ids]
+
+    if re.fullmatch(r"\d+(?:\s*,\s*\d+)*", raw):
+        vals = [int(x.strip()) for x in raw.split(",")]
+        return vals, [f"numeric instrument id {x}" for x in vals]
+
+    query_tokens = _tokens(raw)
+    inst_list = md.getAllInstruments()
+
+    candidates = []
+
+    for inst in inst_list:
+        inst_id, name = _extract_inst(inst)
+        if inst_id is None or not name:
+            continue
+
+        name_l = name.lower()
+        name_tokens = _tokens(name)
+
+        score = 0
+
+        if raw.lower() == name_l:
+            score += 5000
+
+        if raw.lower() in name_l:
+            score += 1200
+
+        overlap = query_tokens.intersection(name_tokens)
+        score += 120 * len(overlap)
+
+        if "millstone" in query_tokens and "hill" in query_tokens and "millstone hill" in name_l:
+            score += 800
+
+        if "is" in query_tokens and "radar" in query_tokens and "is radar" in name_l:
+            score += 1200
+
+        if "incoherent" in query_tokens and "scatter" in query_tokens and "radar" in name_l:
+            score += 1200
+
+        if score > 0:
+            candidates.append((score, inst_id, name))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    if not candidates:
+        raise ValueError(
+            f"Could not resolve instrument '{raw}'. Use a numeric instrument ID, e.g. instrument 30."
+        )
+
+    top = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+
+    if second and (top[0] - second[0]) < 250:
+        lines = [
+            f"AMBIGUOUS_INSTRUMENT: '{raw}'",
+            "Top candidates:",
+        ]
+        for score, inst_id, name in candidates[:8]:
+            lines.append(f"- score {score}: id {inst_id}, {name}")
+        lines.append("Reply with the numeric instrument ID you want.")
+        raise ValueError("\n".join(lines))
+
+    return [top[1]], [f"{raw} -> {top[1]} ({top[2]}) score={top[0]}"]
+
+
+class MadVIRouterExecutorV4(Component):
+    display_name = "MadVI Router Executor v4"
+    description = (
+        "Mandatory single front-door tool for MadVI; call it for every user request. "
+        "The Agent should pass a self-contained query that preserves relevant Madrigal context from prior turns. "
+        "The component rejects requests outside the Madrigal/geospace domain, then deterministically routes "
+        "in-scope requests to Docs, Papers, SQL metadata retrieval, or Madrigal citation creation internally. "
+        "SQL supports exact year/month/date windows, generic science-product availability counts, "
+        "GFZ space-weather indices, and date-based Madrigal + space-weather joins. "
+        "Use this instead of exposing separate docs/papers/SQL/citation tools to the Agent."
+    )
+    icon = "workflow"
+    name = "madvi_router_executor_v4"
+    trace_type = "tool"
+
+    DOCS_PERSIST_DIR = "./madrigal_html_docs_3"
+    DOCS_COLLECTION = "madrigal_html_docs_3"
+
+    PAPERS_PERSIST_DIR = "./madrigal_papers_table2"
+    PAPERS_COLLECTION = "madrigal_papers_table2"
+
+    SQL_DB_PATH = "/home/domo/Langflow311/madrigal_headers.db"
+    SPACE_WEATHER_DB_PATH = "/home/domo/Langflow311/space_weather.db"
+
+    DOCS_CANDIDATE_K = 10
+    DOCS_RETURN_K = 4
+    DOCS_MAX_CHARS = 2200
+
+    PAPERS_CANDIDATE_K = 12
+    PAPERS_RETURN_K = 3
+    PAPERS_MAX_CHARS = 3200
+
+    SQL_DEFAULT_LIMIT = 15
+
+    inputs = [
+        MessageTextInput(name="query", display_name="User Query", tool_mode=True),
+        SecretStrInput(name="openai_api_key", display_name="OpenAI API Key", required=False, load_from_db=True),
+        MessageTextInput(name="madrigal_url", display_name="Madrigal URL", tool_mode=True, value=DEFAULT_MADRIGAL_URL),
+        MessageTextInput(name="sql_db_path", display_name="SQL DB Path optional", tool_mode=True, value=""),
+        MessageTextInput(name="space_weather_db_path", display_name="Space Weather DB Path optional", tool_mode=True, value=""),
+        BoolInput(name="include_non_default", display_name="Citation: include non-default files", value=False, tool_mode=True),
+        BoolInput(name="use_local", display_name="Citation: use local site", value=False, tool_mode=True),
+    ]
+
+    outputs = [
+        Output(display_name="Results", name="results", method="run"),
+    ]
+
+    def _route(self, query: str) -> Tuple[str, str]:
+        """
+        Priority-safe deterministic router.
+
+        Routing order is intentional:
+        0. Universal Madrigal-only scope gate
+        1. Madrigal citation actions
+        2. Explicit literature/paper requests
+        3. Exact SQL metadata/count/coverage requests
+        4. Documentation/API/script questions
+        5. Scientific-topic fallback to papers
+        6. Documentation fallback for in-scope Madrigal queries
+
+        A year, instrument name, Madrigal, ISR, or the word "data" alone never
+        forces SQL. SQL requires an explicit metadata operation such as count,
+        availability, coverage, inventory, parameter definition, or file lookup.
+        """
+        q = _norm(query)
+
+        # ------------------------------------------------------------
+        # 0. Universal Madrigal-only domain boundary
+        # ------------------------------------------------------------
+        if not _is_madrigal_scope_query(query):
+            return "OUT_OF_SCOPE", "Query is outside the Madrigal/geospace domain supported by MadVI."
+
+        # ------------------------------------------------------------
+        # 1. Explicit state-changing Madrigal citation action
+        # ------------------------------------------------------------
+        if _is_citation_action_query(query):
+            return "MADRIGAL_CITATION", "Explicit Madrigal citation creation/dry-run action."
+
+        # ------------------------------------------------------------
+        # 2. Literature intent has priority over every read-only route.
+        # This prevents publication years such as "after 2021" from being
+        # mistaken for metadata time windows.
+        # ------------------------------------------------------------
+        paper_noun_pattern = (
+            r"\b(?:paper|papers|study|studies|article|articles|publication|publications|"
+            r"literature|journal article|journal papers?|research paper|scientific paper|"
+            r"scientific study|authors?)\b"
+        )
+        paper_action_pattern = (
+            r"\b(?:find|search|locate|identify|recommend|retrieve|show|list|provide|"
+            r"give|look for|look up|cite|summarize|compare)\b"
+        )
+
+        has_paper_noun = bool(re.search(paper_noun_pattern, q))
+        has_paper_action = bool(re.search(paper_action_pattern, q))
+        has_publication_filter = bool(re.search(
+            r"\b(?:published|publication year|after|before|since|newer than|older than|"
+            r"recent|latest|earliest|between)\b",
+            q,
+        ))
+        has_paper_question = bool(re.search(
+            r"\b(?:which|what|whose|is there|are there|do you know of|can you find|"
+            r"could you find|find me)\b.*" + paper_noun_pattern,
+            q,
+        ))
+        has_paper_usage_language = bool(re.search(
+            paper_noun_pattern + r".*\b(?:used|using|uses|studied|studying|reported|found|"
+            r"analyzed|analysed|included|based on|with)\b",
+            q,
+        ))
+
+        explicit_literature_terms = [
+            "literature review",
+            "scientific literature",
+            "research literature",
+            "papers that used",
+            "paper that used",
+            "studies that used",
+            "study that used",
+            "research that used",
+            "find a paper",
+            "find me a paper",
+            "find papers",
+            "search papers",
+            "search for a paper",
+            "which papers",
+            "what papers",
+            "which studies",
+            "what studies",
+            "paper published",
+            "papers published",
+            "study published",
+            "article published",
+        ]
+
+        if (
+            _contains_any(q, explicit_literature_terms)
+            or has_paper_question
+            or (has_paper_noun and has_paper_action)
+            or (has_paper_noun and has_publication_filter)
+            or has_paper_usage_language
+        ):
+            return "PAPERS", "Explicit scientific literature/publication request."
+
+        # ------------------------------------------------------------
+        # 3. SQL metadata route. SQL must be requested through an actual
+        # metadata operation, not merely by mentioning a year or data.
+        # ------------------------------------------------------------
+        sql_strong_terms = [
+            "which instruments contain",
+            "what instruments contain",
+            "which instruments have",
+            "what instruments have",
+            "which files contain",
+            "what files contain",
+            "which datasets contain",
+            "what datasets contain",
+            "what parameters are available",
+            "which parameters are available",
+            "parameters available for",
+            "parameter coverage",
+            "instrument coverage",
+            "file coverage",
+            "time coverage",
+            "metadata inventory",
+            "file_index",
+            "file index",
+            "exact coverage",
+            "exact availability",
+            "exact madrigal parameter definitions",
+            "parameter definitions",
+            "parameter definition",
+            "definitions and units",
+            "definition and units",
+            "parameter units",
+            "units for",
+            "unit for",
+            "mnemonic",
+            "mnemonics",
+            "parmcode",
+            "parmcodes",
+            "parmcodes.txt",
+            "show 10 files",
+            "show files",
+            "show file records",
+            "which instruments exist",
+            "what instruments exist",
+            "which parameters exist",
+            "what parameters exist",
+            "start_time_utc",
+            "end_time_utc",
+            "latest start_time_utc",
+            "earliest start_time_utc",
+            "latest start",
+            "earliest start",
+            "latest file",
+            "earliest file",
+            "sql metadata index",
+            "metadata index",
+            "max start_time_utc",
+            "min start_time_utc",
+            "database coverage",
+            "db coverage",
+            "indexed range",
+            "date range of the index",
+        ]
+
+        if _contains_any(q, sql_strong_terms):
+            return "HEADERS_SQL", "Explicit metadata inventory/definition/file lookup request."
+
+        # Structured space-weather requests go to SQL after literature intent has
+        # already had priority above.
+        if _has_space_weather_terms(query):
+            sw_window = _extract_sql_time_window(query)
+            sw_conditions = _extract_space_weather_conditions(query)
+            sw_intent = _space_weather_intent(query)
+            if sw_conditions or sw_window or sw_intent in {"count", "list_days", "list_files", "max", "min", "mean", "latest"}:
+                return "HEADERS_SQL", "Structured GFZ space-weather or combined Madrigal/space-weather query."
+
+        metric = _availability_metric(query)
+        window = _extract_sql_time_window(query)
+        product = _detect_availability_product(query)
+
+        has_instrument_or_site_scope = bool(
+            _extract_explicit_instrument_ids(query)
+            or re.search(r"\b(?:isr|incoherent scatter|is radar|radar|instrument|kinst)\b", q)
+            or _contains_any(q, [
+                "millstone hill",
+                "jicamarca",
+                "arecibo",
+                "poker flat",
+                "sondrestrom",
+                "fabry-perot",
+                "fabry perot",
+                "fpi",
+            ])
+        )
+        has_data_scope = bool(
+            product
+            or has_instrument_or_site_scope
+            or re.search(r"\b(?:data|files?|datasets?|experiments?|measurements?|records?|parameters?)\b", q)
+        )
+        has_availability_language = bool(re.search(
+            r"\b(?:available|availability|coverage|covered|exist|exists|present|holdings?)\b",
+            q,
+        ))
+        has_count_language = bool(re.search(
+            r"\b(?:how many|how much|count|number of|distinct days?|file count)\b",
+            q,
+        ))
+
+        # Generic day/file/measurement counter handled by the SQL executor.
+        if metric and window and has_data_scope:
+            return "HEADERS_SQL", "Explicit time-bounded metadata count request."
+
+        # Natural availability questions that do not literally say "how many".
+        if window and has_data_scope and (has_availability_language or has_count_language):
+            return "HEADERS_SQL", "Explicit time-bounded metadata availability request."
+
+        # Non-time-bounded but still unambiguous metadata operations.
+        sql_operation_patterns = [
+            r"\b(?:list|show|return)\b.*\b(?:files?|instruments?|parameters?|datasets?|records?)\b",
+            r"\b(?:which|what)\b.*\b(?:files?|instruments?|parameters?|datasets?)\b.*\b(?:contain|have|include|exist)\b",
+            r"\b(?:count|number of|how many)\b.*\b(?:files?|instruments?|parameters?|datasets?|experiments?)\b",
+            r"\b(?:first|last|earliest|latest|min|max)\b.*\b(?:time|date|file|record)\b",
+        ]
+        if any(re.search(pattern, q) for pattern in sql_operation_patterns):
+            return "HEADERS_SQL", "Explicit metadata operation request."
+
+        # ------------------------------------------------------------
+        # 4. Documentation/API/script/workflow questions
+        # ------------------------------------------------------------
+        docs_terms = [
+            "documentation",
+            "docs",
+            "api",
+            "script",
+            "command line",
+            "usage",
+            "developer guide",
+            "user guide",
+            "install",
+            "installation",
+            "configure",
+            "configuration",
+            "architecture",
+            "metadata structure",
+            "data model",
+            "insttab",
+            "exptab",
+            "filetab",
+            "globaldownload",
+            "globalisprint",
+            "globalcitation",
+            "madrigaldata",
+            "madrigalweb",
+            "getexperiments",
+            "getexperimentfiles",
+            "citation api",
+            "permanent link",
+            "citable link",
+            "persistent link",
+            "zenodo replacement",
+            "difference between",
+            "when should",
+            "how does",
+            "how do i use",
+            "how to use",
+        ]
+
+        if _contains_any(q, docs_terms):
+            return "DOCS", "Documentation/API/script/workflow query."
+
+        # ------------------------------------------------------------
+        # 5. Scientific subject questions default to the paper corpus when
+        # no exact metadata operation was requested.
+        # ------------------------------------------------------------
+        science_terms = [
+            "geomagnetic",
+            "storm",
+            "storms",
+            "storm-time",
+            "storm time",
+            "substorm",
+            "saps",
+            "said",
+            "tec",
+            "isr",
+            "dmsp",
+            "electron density",
+            "electron temperature",
+            "ion temperature",
+            "neutral wind",
+            "ion drift",
+            "traveling ionospheric disturbance",
+            "traveling ionospheric disturbances",
+            "tid",
+            "tids",
+            "mstid",
+            "mstids",
+            "climatology",
+            "ionospheric behavior",
+            "ionospheric response",
+            "ionosphere",
+            "sed",
+            "sar arc",
+            "tad",
+        ]
+
+        if _contains_any(q, science_terms):
+            return "PAPERS", "Scientific topic query without an explicit metadata operation."
+
+        # ------------------------------------------------------------
+        # 6. Conservative fallback: Madrigal documentation
+        # ------------------------------------------------------------
+        return "DOCS", "Default documentation fallback."
+
+    def _run_citation(self, query: str) -> Message:
+        url = _normalize_url(_to_text(self.madrigal_url))
+        md = MadrigalData(url)
+
+        instrument_raw = _extract_instrument_text(query)
+        start_date, end_date = _parse_dates(query)
+
+        if not instrument_raw:
+            return Message(text=("[Citation]\nMISSING_CITATION_INPUTS\n\nReason: Missing instrument.\n\nExample:\nCreate a dry-run Madrigal citation for instrument 30 from 2020-01-01 to 2020-12-31. Use Nano, mrojas98@mit.edu, MIT."))
+
+        if not start_date or not end_date:
+            return Message(text=("[Citation]\nMISSING_CITATION_INPUTS\n\nReason: Missing date range.\n\nExample date range:\nfrom 2020-01-01 to 2020-12-31"))
+
+        fullname, email, affiliation = _parse_identity(query)
+        start_dt = _parse_date(start_date)
+        end_dt = _parse_date(end_date)
+        inst_ids, inst_debug = _resolve_instruments(md, instrument_raw)
+
+        raw_citations = md.getCitationListFromFilters(
+            startDate=start_dt, endDate=end_dt, inst=inst_ids, kindat=None,
+            seasonalStartDate=None, seasonalEndDate=None,
+            includeNonDefault=bool(self.include_non_default), expName=None,
+            excludeExpName=None, fileDesc=None, dateList=None,
+        )
+
+        valid_citations = [html.unescape(str(c).strip()) for c in raw_citations if _valid_citation(str(c))]
+
+        if not valid_citations:
+            return Message(text=(
+                "[Citation]\nNO_VALID_CITATIONS\n\n"
+                "No valid Madrigal file citations were found with the given filters.\n\n"
+                f"Madrigal URL: {url}\nInstrument input: {instrument_raw}\nResolved instrument IDs: {inst_ids}\n"
+                f"Date range: {start_date} to {end_date}\nInclude non-default files: {bool(self.include_non_default)}\n\n"
+                "Try a wider date range, a numeric instrument ID, or enable include_non_default."
+            ))
+
+        q = _norm(query)
+        real_creation_terms = [
+            "real madrigal citation", "real citation", "real citation group", "create the real",
+            "create real", "actually create", "permanent citation group", "create permanent",
+            "not a dry run", "not dry run", "not dry-run", "dry_run false", "dry_run=false",
+        ]
+        dry_run_terms = ["dry run", "dry-run", "preview", "test only", "dry_run true", "dry_run=true"]
+
+        dry_run = True
+        if any(term in q for term in dry_run_terms):
+            dry_run = True
+        if any(term in q for term in real_creation_terms):
+            dry_run = False
+
+        preview = "\n".join(valid_citations[:10])
+        package_nudge = (
+            "\n\nZENODO_PACKAGE_NUDGE:\n"
+            "This Madrigal citation result can be used as the Madrigal provenance layer of a full Zenodo/DOI package.\n"
+            "Next step prompt:\n"
+            "\"Build a DOI-ready Zenodo package from this Madrigal citation result, including the cited HDF5 file references, retrieval provenance, citation group URL if created, metadata, and a README.\"\n\n"
+            "Important: Madrigal citation groups are not Zenodo DOIs by themselves. To include actual HDF5 files inside the Zenodo package, the package workflow must download or receive the cited files."
+        )
+
+        if dry_run:
+            return Message(text=(
+                "[Citation]\nDRY_RUN(madvi_router_executor_v4)\n\n[Madrigal Native Citation Preview]\n\n"
+                f"Madrigal URL: {url}\nInstrument input: {instrument_raw}\nResolved instrument IDs: {inst_ids}\n"
+                f"Date range: {start_date} to {end_date}\nUser full name: {fullname}\nUser email: {email}\n"
+                f"User affiliation: {affiliation}\nValid citation count: {len(valid_citations)}\n\n"
+                f"First cited file references:\n{preview}\n\n"
+                "No permanent citation group was created because dry_run=True.\n\n"
+                "Notes:\n- This is a Madrigal-native citation preview.\n- This is not a Zenodo DOI deposit.\n- Use a real citation request only when the user explicitly asks to create it."
+                f"{package_nudge}"
+            ))
+
+        group_url = md.createCitationGroupFromList(valid_citations, fullname, email, affiliation, useLocal=bool(self.use_local))
+        group_url = html.unescape(str(group_url).strip())
+
+        if not group_url.startswith("http"):
+            return Message(text=f"[Citation]\nERROR(madvi_router_executor_v4): Madrigal did not return a valid citation group URL.\n\nReturned value:\n{group_url}")
+
+        recovered_files = md.getCitedFilesFromUrl(group_url)
+        recovered_files = [html.unescape(str(f).strip()) for f in recovered_files if str(f).strip()]
+        recovered_preview = "\n".join(recovered_files[:10])
+
+        return Message(text=(
+            "[Citation]\nSUCCESS(madvi_router_executor_v4)\n\n[Madrigal Native Citation Created]\n\n"
+            f"Citation Group URL:\n{group_url}\n\nMadrigal URL: {url}\nInstrument input: {instrument_raw}\n"
+            f"Resolved instrument IDs: {inst_ids}\nDate range: {start_date} to {end_date}\nUser full name: {fullname}\n"
+            f"User email: {email}\nUser affiliation: {affiliation}\nValid citation count: {len(valid_citations)}\n"
+            f"Recovered file count: {len(recovered_files)}\n\nFirst recovered/cited files:\n{recovered_preview}\n\n"
+            "Notes:\n- This is a Madrigal-native persistent citation group.\n- This is not a Zenodo DOI deposit.\n- Use this as provenance for reproducible papers, notebooks, or DOI-ready packages."
+            f"{package_nudge}"
+        ))
+
+    def _looks_like_docs_record(self, doc: str) -> bool:
+        text = _norm(doc)
+        return any(x in text for x in [
+            "globaldownload", "globalisprint", "globalcitation", "madrigaldata", "madrigalweb",
+            "getexperiments", "metadata", "api", "installation", "configuration", "cedar", "madrigal",
+        ])
+
+    def _run_docs(self, query: str, api_key: str) -> Message:
+        emb = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
+        q_emb = emb.embed_query(query)
+
+        client = chromadb.PersistentClient(path=self.DOCS_PERSIST_DIR)
+        col = client.get_collection(self.DOCS_COLLECTION)
+
+        res = col.query(query_embeddings=[q_emb], n_results=self.DOCS_CANDIDATE_K, include=["documents", "distances"])
+        docs = res.get("documents", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+
+        if not docs:
+            return Message(text=f"[Docs]\nNO_RESULTS\n\nQUERY: {query}")
+
+        valid = []
+        for i, doc in enumerate(docs):
+            if not doc:
+                continue
+            if not self._looks_like_docs_record(doc):
+                continue
+            dist = dists[i] if i < len(dists) else None
+            valid.append({"doc": doc, "distance": dist, "rank": i + 1})
+
+        if not valid:
+            return Message(text=("[Docs]\nNO_VALID_DOC_RESULTS\n\nReason: Chroma returned records, but none appeared to be valid Madrigal documentation records.\n\n" f"QUERY: {query}"))
+
+        selected = valid[: self.DOCS_RETURN_K]
+        blocks = []
+        for idx, item in enumerate(selected, start=1):
+            distance_txt = f"{item['distance']:.4f}" if item["distance"] is not None else "unknown"
+            blocks.append(f"[{idx}] Madrigal Documentation\n\nRAW_CHROMA_RANK: {item['rank']}\nVECTOR_DISTANCE: {distance_txt}\n\n{item['doc'][:self.DOCS_MAX_CHARS].strip()}")
+
+        return Message(text=(
+            "[Docs]\n[Docs Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: DOCS\n"
+            f"COLLECTION: {self.DOCS_COLLECTION}\nQUERY: {query}\nCANDIDATES_RETRIEVED: {len(docs)}\n"
+            f"VALID_DOC_CANDIDATES: {len(valid)}\nRETURNED_RESULTS: {len(selected)}\n\n" + "\n\n".join(blocks)
+        ))
+
+    def _looks_like_paper_record(self, doc: str) -> bool:
+        text = _norm(doc)
+        markers = ["q1", "q2", "q3", "q4", "main findings", "main conclusions", "what data from madrigal was used", "paper:"]
+        return sum(1 for x in markers if x in text) >= 2
+
+    def _rerank_paper(self, query: str, doc: str, base_distance: float) -> float:
+        q = _norm(query)
+        d = _norm(doc)
+        score = 100.0 - (base_distance * 100.0)
+        for kw in ["dmsp", "electron density", "geomagnetic", "storm", "storms", "tec", "saps", "isr", "climatology", "substorm", "ionosphere"]:
+            if kw in q and kw in d:
+                score += 4.0
+        return round(score, 2)
+
+    def _run_papers(self, query: str, api_key: str) -> Message:
+        emb = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
+        q_emb = emb.embed_query(query)
+
+        client = chromadb.PersistentClient(path=self.PAPERS_PERSIST_DIR)
+        col = client.get_collection(self.PAPERS_COLLECTION)
+
+        res = col.query(query_embeddings=[q_emb], n_results=self.PAPERS_CANDIDATE_K, include=["documents", "distances"])
+        docs = res.get("documents", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+
+        if not docs:
+            return Message(text=f"[Papers]\nNO_RESULTS\n\nQUERY: {query}")
+
+        valid = []
+        for i, doc in enumerate(docs):
+            if not doc:
+                continue
+            if not self._looks_like_paper_record(doc):
+                continue
+            dist = dists[i] if i < len(dists) else 1.0
+            rerank = self._rerank_paper(query, doc, dist)
+            valid.append({"doc": doc, "distance": dist, "rerank": rerank, "rank": i + 1})
+
+        if not valid:
+            return Message(text=("[Papers]\nNO_VALID_PAPER_RESULTS\n\nReason: Chroma returned records, but none appeared to be valid scientific-paper records.\n\n" f"QUERY: {query}"))
+
+        valid = sorted(valid, key=lambda x: x["rerank"], reverse=True)
+        selected = valid[: self.PAPERS_RETURN_K]
+
+        blocks = []
+        for idx, item in enumerate(selected, start=1):
+            blocks.append(
+                "[%d] madrigal_papers_table\n\nRERANK_SCORE: %.2f\nRAW_CHROMA_RANK: %d\nVECTOR_DISTANCE: %.4f\n\n%s"
+                % (idx, item["rerank"], item["rank"], item["distance"], item["doc"][:self.PAPERS_MAX_CHARS].strip())
+            )
+
+        return Message(text=(
+            "[Papers]\n[Papers Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: PAPERS\n"
+            f"COLLECTION: {self.PAPERS_COLLECTION}\nQUERY: {query}\nCANDIDATES_RETRIEVED: {len(docs)}\n"
+            f"VALID_PAPER_CANDIDATES: {len(valid)}\nRETURNED_RESULTS: {len(selected)}\n\n" + "\n\n".join(blocks)
+        ))
+
+    def _get_sql_db_path(self) -> str:
+        custom = _to_text(getattr(self, "sql_db_path", "")).strip()
+        return custom or self.SQL_DB_PATH
+
+    def _get_space_weather_db_path(self) -> str:
+        custom = _to_text(getattr(self, "space_weather_db_path", "")).strip()
+        return custom or self.SPACE_WEATHER_DB_PATH
+
+    def _connect_sql(self):
+        """Connect to headers DB and attach space_weather.db as schema `sw` when available."""
+        conn = sqlite3.connect(self._get_sql_db_path())
+        sw_path = self._get_space_weather_db_path()
+        if sw_path and os.path.isfile(sw_path):
+            try:
+                conn.execute("ATTACH DATABASE ? AS sw", (sw_path,))
+            except sqlite3.OperationalError as e:
+                if "already in use" not in str(e).lower():
+                    conn.close()
+                    raise
+        return conn
+
+    def _fetch_sql(self, sql: str, params: tuple = ()) -> List[tuple]:
+        conn = self._connect_sql()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+    def _table_exists(self, table_name: str, schema: str = "main") -> bool:
+        safe_schema = "sw" if schema == "sw" else "main"
+        try:
+            rows = self._fetch_sql(
+                f"SELECT name FROM {safe_schema}.sqlite_master WHERE type='table' AND LOWER(name)=LOWER(?)",
+                (table_name,),
+            )
+            return bool(rows)
+        except sqlite3.Error:
+            return False
+
+    def _space_weather_ready(self) -> bool:
+        return self._table_exists("space_weather_daily", schema="sw")
+
+    def _space_weather_missing_message(self, query: str) -> Message:
+        return Message(text=(
+            "[SQL Tool]\nSPACE_WEATHER_DB_UNAVAILABLE\n\n"
+            "This query requires the GFZ space-weather database, but space_weather.db "
+            "could not be found or does not contain the expected space_weather_daily table.\n\n"
+            "Expected default path: /home/domo/Langflow311/space_weather.db\n"
+            "You can override it with the Space Weather DB Path input.\n\n"
+            f"QUERY: {query}"
+        ))
+
+    def _format_rows(self, rows: List[tuple], headers: List[str]) -> str:
+        if not rows:
+            return "NO_RESULTS"
+        lines = []
+        header_line = " | ".join(headers)
+        lines.append(header_line)
+        lines.append("-" * len(header_line))
+        for row in rows:
+            lines.append(" | ".join("" if x is None else str(x) for x in row))
+        return "\n".join(lines)
+
+    def _extract_mnemonics(self, query: str) -> List[str]:
+        q = _norm(query)
+        known = ["gdalt", "ti", "te", "tec", "ne", "nel", "popl", "dpop", "vo", "vi", "gdlat", "gdlon", "glon", "range", "azm", "elm", "kp", "dst"]
+        found = []
+        for mnemonic in known:
+            if re.search(rf"\b{re.escape(mnemonic)}\b", q):
+                found.append(mnemonic.upper())
+        return found
+
+    def _param_where_clause(self, param: str, alias: str = "p") -> Tuple[str, Tuple[str, ...]]:
+        p = _norm(param)
+
+        if p in ["electron density", "density", "ne", "nel"] or "electron density" in p:
+            return (
+                f"(UPPER({alias}.mnemonic) IN ('NE','NEL') OR LOWER({alias}.description) LIKE '%electron density%')",
+                tuple(),
+            )
+
+        if p in ["electron temperature", "temperature electrons", "te"] or "electron temperature" in p:
+            return (
+                f"(UPPER({alias}.mnemonic) = 'TE' OR LOWER({alias}.description) LIKE '%electron temperature%')",
+                tuple(),
+            )
+
+        if p in ["ion temperature", "ti"] or "ion temperature" in p:
+            return (
+                f"(UPPER({alias}.mnemonic) = 'TI' OR LOWER({alias}.description) LIKE '%ion temperature%')",
+                tuple(),
+            )
+
+        token = p.strip().upper()
+        like = f"%{p}%"
+        return (
+            f"(UPPER({alias}.mnemonic) = ? OR LOWER({alias}.mnemonic) LIKE ? OR LOWER({alias}.description) LIKE ?)",
+            (token, like, like),
+        )
+
+    def _instrument_isr_clause(self, alias: str = "f") -> str:
+        """
+        ISR-family matching for the current MadVI headers index.
+
+        Millstone Hill data can be indexed under the site-wide IS Radar name
+        or under the UHF steerable/zenith antenna instrument records.
+        """
+        return (
+            f"(LOWER({alias}.instrument) LIKE '%radar%' "
+            f"OR LOWER({alias}.instrument) LIKE '%incoherent%' "
+            f"OR LOWER({alias}.instrument) LIKE '%isr%' "
+            f"OR LOWER({alias}.instrument) LIKE '%is radar%' "
+            f"OR LOWER({alias}.instrument) LIKE '%uhf steerable antenna%' "
+            f"OR LOWER({alias}.instrument) LIKE '%uhf zenith antenna%' "
+            f"OR EXISTS ("
+            f"SELECT 1 FROM file_instruments fi_isr "
+            f"WHERE fi_isr.file_index = {alias}.file_index "
+            f"AND fi_isr.instrument_code IN (30,31,32)"
+            f"))"
+        )
+
+    def _availability_product_clause(
+        self,
+        product: Optional[Dict[str, object]],
+        alias: str = "p",
+    ) -> Tuple[str, Tuple[str, ...]]:
+        if not product:
+            return "", tuple()
+
+        codes = [str(x).upper() for x in product.get("codes", []) if str(x).strip()]
+        description_terms = [
+            _norm(str(x))
+            for x in product.get("description_terms", [])
+            if str(x).strip()
+        ]
+
+        pieces = []
+        params: List[str] = []
+
+        if codes:
+            placeholders = ",".join(["?"] * len(codes))
+            pieces.append(f"UPPER({alias}.mnemonic) IN ({placeholders})")
+            params.extend(codes)
+
+        for term in description_terms:
+            pieces.append(f"LOWER({alias}.description) LIKE ?")
+            params.append(f"%{term}%")
+
+        if not pieces:
+            return "", tuple()
+
+        return "(" + " OR ".join(pieces) + ")", tuple(params)
+
+    def _availability_instrument_scope(
+        self,
+        query: str,
+        alias: str = "f",
+    ) -> Tuple[str, Tuple[object, ...], str]:
+        q = _norm(query)
+        clauses = []
+        params: List[object] = []
+        labels = []
+
+        explicit_ids = _extract_explicit_instrument_ids(query)
+        if explicit_ids:
+            placeholders = ",".join(["?"] * len(explicit_ids))
+            clauses.append(
+                f"EXISTS ("
+                f"SELECT 1 FROM file_instruments fi_explicit "
+                f"WHERE fi_explicit.file_index = {alias}.file_index "
+                f"AND fi_explicit.instrument_code IN ({placeholders})"
+                f")"
+            )
+            params.extend(explicit_ids)
+            labels.append("instrument ID " + ", ".join(str(x) for x in explicit_ids))
+
+        isr_requested = (
+            re.search(r"\bisr\b", q)
+            or "incoherent scatter" in q
+            or "is radar" in q
+            or "radar instruments" in q
+            or "radar data" in q
+            or "radar measurements" in q
+        )
+        if isr_requested:
+            clauses.append(self._instrument_isr_clause(alias))
+            labels.append("ISR-family instruments")
+
+        if "millstone hill" in q:
+            clauses.append(f"LOWER({alias}.instrument) LIKE ?")
+            params.append("%millstone hill%")
+            labels.append("Millstone Hill")
+
+        if "fabry-perot" in q or "fabry perot" in q or re.search(r"\bfpi\b", q):
+            clauses.append(
+                f"(LOWER({alias}.instrument) LIKE '%fabry%' "
+                f"OR LOWER({alias}.instrument) LIKE '%fpi%')"
+            )
+            labels.append("Fabry-Perot/FPI instruments")
+
+        if not clauses:
+            return "", tuple(), "all indexed instruments"
+
+        return " AND ".join(f"({x})" for x in clauses), tuple(params), " + ".join(labels)
+
+    def _closest_availability_windows(
+        self,
+        product: Optional[Dict[str, object]],
+        instrument_clause: str,
+        instrument_params: Tuple[object, ...],
+        limit: int = 8,
+    ) -> List[tuple]:
+        product_clause, product_params = self._availability_product_clause(product, "p")
+        join_parameters = bool(product_clause)
+
+        sql = """
+            SELECT
+                f.instrument_code_s,
+                f.instrument,
+                MIN(f.start_time_utc) AS first_time_utc,
+                MAX(f.end_time_utc) AS last_time_utc,
+                COUNT(DISTINCT f.file_index) AS file_count
+            FROM files f
+        """
+        if join_parameters:
+            sql += " JOIN parameters p ON p.file_index = f.file_index "
+
+        where = ["f.start_time_utc IS NOT NULL", "f.end_time_utc IS NOT NULL"]
+        params: List[object] = []
+
+        if product_clause:
+            where.append(product_clause)
+            params.extend(product_params)
+
+        if instrument_clause:
+            where.append(instrument_clause)
+            params.extend(instrument_params)
+
+        sql += " WHERE " + " AND ".join(where)
+        sql += """
+            GROUP BY f.instrument_code_s, f.instrument
+            ORDER BY file_count DESC, first_time_utc
+            LIMIT ?
+        """
+        params.append(limit)
+
+        return self._fetch_sql(sql, tuple(params))
+
+    def _space_weather_coverage_summary(self) -> Tuple[str, str, int]:
+        if not self._space_weather_ready():
+            return "unknown", "unknown", 0
+        rows = self._fetch_sql("SELECT MIN(date_utc), MAX(date_utc), COUNT(*) FROM sw.space_weather_daily")
+        if not rows:
+            return "unknown", "unknown", 0
+        return str(rows[0][0]), str(rows[0][1]), int(rows[0][2] or 0)
+
+    def _space_weather_filter_text(self, conditions: List[Dict[str, object]]) -> str:
+        if not conditions:
+            return "none"
+        return " and ".join(
+            f"{x['label']} {x['operator']} {float(x['value']):g}"
+            for x in conditions
+        )
+
+    def _run_space_weather_query(self, query: str, limit: int) -> Optional[Message]:
+        """Handle pure GFZ Kp/ap/Ap/F10.7/SN queries."""
+        if not _has_space_weather_terms(query):
+            return None
+
+        q = _norm(query)
+        product = _detect_availability_product(query)
+        product_codes = {str(x).upper() for x in (product or {}).get("codes", [])}
+        # A bare Kp mention can be detected by the legacy Madrigal mnemonic parser.
+        # Do not mistake that for a request to join against Madrigal holdings.
+        product_is_only_sw_mnemonic = bool(
+            product
+            and str(product.get("label", "")) == "requested Madrigal parameter(s)"
+            and product_codes
+            and product_codes.issubset({"KP"})
+        )
+        madrigal_product = None if product_is_only_sw_mnemonic else product
+        instrument_clause, _, _ = self._availability_instrument_scope(query, "f")
+        madrigal_nouns = bool(re.search(r"\b(?:madrigal|files?|datasets?|measurements?|experiments?|isr|radar|instrument)\b", q))
+        if madrigal_product or instrument_clause or madrigal_nouns:
+            return None
+
+        if not self._space_weather_ready():
+            return self._space_weather_missing_message(query)
+
+        conditions = _extract_space_weather_conditions(query)
+        if _needs_space_weather_threshold_clarification(query):
+            return Message(text=(
+                "[SQL Tool]\nNEEDS_SPACE_WEATHER_THRESHOLD\n\n"
+                "MadVI will not invent a numeric definition for qualitative labels such as "
+                "'high geomagnetic activity', 'storm', or 'quiet conditions'.\n\n"
+                "Use an explicit criterion, for example Kp >= 5, daily Ap > 30, or F10.7obs > 150.\n\n"
+                f"QUERY: {query}"
+            ))
+
+        window = _extract_sql_time_window(query)
+        intent = _space_weather_intent(query)
+        metric = _space_weather_metric(query)
+
+        if intent == "latest" and not window:
+            rows = self._fetch_sql(
+                """
+                SELECT date_utc, kp_max, kp_mean, ap_daily, ap_max,
+                       sunspot_number, f107_obs, f107_adj, definitive_flag
+                FROM sw.space_weather_daily
+                ORDER BY date_utc DESC
+                LIMIT 1
+                """
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_latest\n"
+                f"QUERY: {query}\n\n"
+                + self._format_rows(rows, [
+                    "date_utc", "kp_max", "kp_mean", "Ap_daily", "ap_max",
+                    "sunspot_number", "f107_obs", "f107_adj", "definitive_flag",
+                ])
+                + "\n\nDefinitive flag: 0=Kp and SN preliminary; 1=Kp definitive/SN preliminary; 2=Kp and SN definitive."
+            ))
+
+        if not window:
+            start, end, count = self._space_weather_coverage_summary()
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\n"
+                "Reason: a space-weather query was detected, but no supported calendar window was found.\n\n"
+                "Examples:\n- What was Kp on 2024-05-11?\n- Which days in 2024 had Kp >= 5?\n"
+                "- How many days in May 2024 had F10.7obs > 150?\n- What was the highest Kp in 2024?\n\n"
+                f"Space-weather DB coverage: {start} through {end} ({count} daily rows).\nQUERY: {query}"
+            ))
+
+        start = str(window["start"])
+        end = str(window["end"])
+        cond_sql, cond_params = _space_weather_condition_sql(conditions, "sw")
+        where = ["sw.date_utc >= DATE(?)", "sw.date_utc < DATE(?)"]
+        params: List[object] = [start, end]
+        if cond_sql:
+            where.append(cond_sql)
+            params.extend(cond_params)
+        where_sql = " AND ".join(where)
+
+        if window.get("granularity") == "day" and intent == "summary" and not conditions:
+            daily = self._fetch_sql(
+                f"""
+                SELECT date_utc, kp_max, kp_mean, ap_daily, ap_max,
+                       sunspot_number, f107_obs, f107_adj, definitive_flag
+                FROM sw.space_weather_daily sw
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            intervals = self._fetch_sql(
+                """
+                SELECT interval_no, ut_interval, kp, ap
+                FROM sw.space_weather_3hourly
+                WHERE date_utc >= DATE(?) AND date_utc < DATE(?)
+                ORDER BY interval_no
+                """,
+                (start, end),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_day_detail\n"
+                f"QUERY: {query}\n\nDaily summary:\n"
+                + self._format_rows(daily, [
+                    "date_utc", "kp_max", "kp_mean", "Ap_daily", "ap_max",
+                    "sunspot_number", "f107_obs", "f107_adj", "definitive_flag",
+                ])
+                + "\n\n3-hour Kp/ap intervals (UT):\n"
+                + self._format_rows(intervals, ["interval_no", "ut_interval", "Kp", "ap"])
+                + "\n\nF10.7obs is used as the default F10.7 field for ionospheric/atmospheric queries."
+            ))
+
+        if intent == "count":
+            rows = self._fetch_sql(f"SELECT COUNT(*) FROM sw.space_weather_daily sw WHERE {where_sql}", tuple(params))
+            count = int(rows[0][0] or 0) if rows else 0
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_count\n"
+                f"QUERY: {query}\n\nMatching UTC days in {window['label']}: {count}\n"
+                f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n\n"
+                "Source: attached GFZ space_weather.db. Documented missing sentinels were normalized to SQL NULL."
+            ))
+
+        if intent == "list_days":
+            rows = self._fetch_sql(
+                f"""
+                SELECT date_utc, kp_max, kp_mean, ap_daily, ap_max,
+                       f107_obs, sunspot_number, definitive_flag
+                FROM sw.space_weather_daily sw
+                WHERE {where_sql}
+                ORDER BY date_utc
+                LIMIT ?
+                """,
+                tuple(params) + (limit,),
+            )
+            total_rows = self._fetch_sql(f"SELECT COUNT(*) FROM sw.space_weather_daily sw WHERE {where_sql}", tuple(params))
+            total = int(total_rows[0][0] or 0) if total_rows else 0
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_day_list\n"
+                f"QUERY: {query}\n\nTotal matching UTC days: {total}\n"
+                f"Space-weather filter: {self._space_weather_filter_text(conditions)}\nShowing up to {limit} rows:\n\n"
+                + self._format_rows(rows, [
+                    "date_utc", "kp_max", "kp_mean", "Ap_daily", "ap_max",
+                    "f107_obs", "sunspot_number", "definitive_flag",
+                ])
+            ))
+
+        metric = metric or {"column": "kp_max", "label": "maximum daily Kp", "units": "index"}
+        column = metric["column"]
+        label = metric["label"]
+
+        if intent in {"max", "min"}:
+            direction = "DESC" if intent == "max" else "ASC"
+            rows = self._fetch_sql(
+                f"""
+                SELECT date_utc, {column} AS requested_value, ap_daily, f107_obs,
+                       sunspot_number, definitive_flag
+                FROM sw.space_weather_daily sw
+                WHERE {where_sql} AND {column} IS NOT NULL
+                ORDER BY {column} {direction}, date_utc
+                LIMIT ?
+                """,
+                tuple(params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                f"INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_{intent}\nQUERY: {query}\n\n"
+                f"Requested metric: {label}\nSpace-weather filter: {self._space_weather_filter_text(conditions)}\n\n"
+                + self._format_rows(rows, [
+                    "date_utc", "requested_value", "Ap_daily", "f107_obs", "sunspot_number", "definitive_flag",
+                ])
+            ))
+
+        if intent == "mean":
+            rows = self._fetch_sql(
+                f"SELECT COUNT({column}), AVG({column}), MIN({column}), MAX({column}) FROM sw.space_weather_daily sw WHERE {where_sql} AND {column} IS NOT NULL",
+                tuple(params),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_mean\n"
+                f"QUERY: {query}\n\nMetric: {label}\nSpace-weather filter: {self._space_weather_filter_text(conditions)}\n\n"
+                + self._format_rows(rows, ["valid_days", "mean", "minimum", "maximum"])
+            ))
+
+        rows = self._fetch_sql(
+            f"""
+            SELECT COUNT(*) AS days,
+                   MIN(kp_max), MAX(kp_max), AVG(kp_max),
+                   MIN(ap_daily), MAX(ap_daily), AVG(ap_daily),
+                   MIN(f107_obs), MAX(f107_obs), AVG(f107_obs),
+                   MIN(sunspot_number), MAX(sunspot_number), AVG(sunspot_number)
+            FROM sw.space_weather_daily sw
+            WHERE {where_sql}
+            """,
+            tuple(params),
+        )
+        return Message(text=(
+            "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+            "INTERNAL_ROUTE: HEADERS_SQL\nMODE: space_weather_summary\n"
+            f"QUERY: {query}\n\nWindow: {window['label']}\n"
+            f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n\n"
+            + self._format_rows(rows, [
+                "days", "kp_min_of_daily_max", "kp_max", "kp_mean_of_daily_max",
+                "Ap_min", "Ap_max", "Ap_mean", "f107_obs_min", "f107_obs_max",
+                "f107_obs_mean", "SN_min", "SN_max", "SN_mean",
+            ])
+        ))
+
+    def _run_combined_space_weather_query(self, query: str, limit: int) -> Optional[Message]:
+        """Join Madrigal file/day availability to GFZ daily indices by UTC date."""
+        if not _has_space_weather_terms(query):
+            return None
+
+        q = _norm(query)
+        product = _detect_availability_product(query)
+        product_codes0 = {str(x).upper() for x in (product or {}).get("codes", [])}
+        product_is_only_sw_mnemonic = bool(
+            product
+            and str(product.get("label", "")) == "requested Madrigal parameter(s)"
+            and product_codes0
+            and product_codes0.issubset({"KP"})
+        )
+        if product_is_only_sw_mnemonic:
+            product = None
+
+        product_clause, product_params = self._availability_product_clause(product, "p")
+        instrument_clause, instrument_params, instrument_label = self._availability_instrument_scope(query, "f")
+        conditions = _extract_space_weather_conditions(query)
+        has_madrigal_scope = bool(
+            product or instrument_clause
+            or re.search(r"\b(?:madrigal|files?|datasets?|measurements?|experiments?)\b", q)
+        )
+        explicit_join_language = bool(
+            "on days with" in q or "during days" in q or "days with" in q
+            or "when kp" in q or "when ap" in q or "when f10.7" in q or "when f107" in q
+        )
+        join_requested = bool(conditions or product or instrument_clause or explicit_join_language)
+        if not has_madrigal_scope or not join_requested:
+            return None
+
+        if not self._space_weather_ready():
+            return self._space_weather_missing_message(query)
+
+        if _needs_space_weather_threshold_clarification(query):
+            return Message(text=(
+                "[SQL Tool]\nNEEDS_SPACE_WEATHER_THRESHOLD\n\n"
+                "This combined request uses a qualitative condition. MadVI will not silently decide what "
+                "counts as a storm, high activity, or quiet conditions.\n\n"
+                "Specify a numeric criterion, for example Kp >= 5, daily Ap > 30, or F10.7obs > 150.\n\n"
+                f"QUERY: {query}"
+            ))
+
+        window = _extract_sql_time_window(query)
+        if not window:
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\n"
+                "Reason: combined Madrigal + space-weather joins require an explicit calendar window.\n\n"
+                "Examples:\n- How many ISR electron-density days in 2024 had Kp >= 5?\n"
+                "- Which Millstone Hill electron-density days in May 2024 had Kp > 6?\n"
+                "- What was the maximum Kp on ISR electron-density days in August 2019?\n\n"
+                f"QUERY: {query}"
+            ))
+
+        intent = _space_weather_intent(query)
+        metric = _space_weather_metric(query)
+        start = str(window["start"])
+        end = str(window["end"])
+        join_parameters = bool(product_clause)
+
+        cte = """
+            WITH RECURSIVE
+            bounds AS (SELECT ? AS window_start, ? AS window_end),
+            matching_files AS (
+                SELECT DISTINCT
+                    f.file_index, f.instrument, f.instrument_code_s,
+                    f.start_time_utc, f.end_time_utc,
+                    DATE(CASE WHEN f.start_time_utc < b.window_start THEN b.window_start ELSE f.start_time_utc END) AS start_day,
+                    DATE(CASE
+                        WHEN COALESCE(f.end_time_utc, f.start_time_utc) >= b.window_end
+                            THEN strftime('%Y-%m-%dT%H:%M:%S+00:00', b.window_end, '-1 second')
+                        ELSE COALESCE(f.end_time_utc, f.start_time_utc)
+                    END) AS end_day
+                FROM files f
+                CROSS JOIN bounds b
+        """
+        if join_parameters:
+            cte += " JOIN parameters p ON p.file_index = f.file_index "
+
+        where = [
+            "f.start_time_utc IS NOT NULL",
+            "f.start_time_utc < b.window_end",
+            "COALESCE(f.end_time_utc, f.start_time_utc) >= b.window_start",
+        ]
+        params: List[object] = [start, end]
+        if product_clause:
+            where.append(product_clause)
+            params.extend(product_params)
+        if instrument_clause:
+            where.append(instrument_clause)
+            params.extend(instrument_params)
+
+        cte += " WHERE " + " AND ".join(where)
+        cte += """
+            ),
+            recursive_days(file_index, instrument, instrument_code_s, day, end_day) AS (
+                SELECT file_index, instrument, instrument_code_s, start_day, end_day
+                FROM matching_files
+                WHERE start_day IS NOT NULL AND end_day IS NOT NULL
+                UNION ALL
+                SELECT file_index, instrument, instrument_code_s, DATE(day, '+1 day'), end_day
+                FROM recursive_days
+                WHERE day < end_day
+            ),
+            daily_matches AS (
+                SELECT rd.day AS date_utc,
+                       COUNT(DISTINCT rd.file_index) AS file_count,
+                       COUNT(DISTINCT rd.instrument_code_s || '|' || rd.instrument) AS instrument_count
+                FROM recursive_days rd
+                GROUP BY rd.day
+            )
+        """
+
+        sw_clause, sw_params = _space_weather_condition_sql(conditions, "sw")
+        joined_where_sql = (" WHERE " + sw_clause) if sw_clause else ""
+        product_label = str(product["label"]) if product else "all matching Madrigal data"
+        product_codes = ", ".join(str(x) for x in product.get("codes", [])) if product else "not restricted"
+
+        coverage_rows = self._fetch_sql(
+            cte + """
+            SELECT COUNT(*) AS madrigal_days,
+                   SUM(CASE WHEN sw.date_utc IS NOT NULL THEN 1 ELSE 0 END) AS days_with_space_weather
+            FROM daily_matches dm
+            LEFT JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+            """,
+            tuple(params),
+        )
+        madrigal_days = int(coverage_rows[0][0] or 0) if coverage_rows else 0
+        days_with_sw = int(coverage_rows[0][1] or 0) if coverage_rows else 0
+
+        if madrigal_days == 0:
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_join\n"
+                f"QUERY: {query}\n\nNo matching Madrigal-covered UTC days were found in {window['label']}.\n"
+                f"Science product: {product_label}\nMatched parameter mnemonics/aliases: {product_codes}\n"
+                f"Instrument scope: {instrument_label}\n\n"
+                "Caveat: this applies only to the local MadVI headers index, not all Madrigal holdings."
+            ))
+
+        sw_coverage_note = (
+            f"Space-weather rows were available for {days_with_sw} of {madrigal_days} matching Madrigal UTC days."
+            if days_with_sw < madrigal_days
+            else f"Space-weather rows were available for all {madrigal_days} matching Madrigal UTC days."
+        )
+
+        if intent == "list_files":
+            file_rows = self._fetch_sql(
+                cte + f"""
+                SELECT DISTINCT rd.file_index, rd.instrument_code_s, rd.instrument,
+                       mf.start_time_utc, mf.end_time_utc, rd.day AS qualifying_date,
+                       sw.kp_max, sw.ap_daily, sw.f107_obs, sw.sunspot_number
+                FROM recursive_days rd
+                JOIN matching_files mf ON mf.file_index = rd.file_index
+                JOIN sw.space_weather_daily sw ON sw.date_utc = rd.day
+                {joined_where_sql}
+                ORDER BY rd.day, rd.file_index
+                LIMIT ?
+                """,
+                tuple(params) + tuple(sw_params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_file_list\n"
+                f"QUERY: {query}\n\nScience product: {product_label}\nInstrument scope: {instrument_label}\n"
+                f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n{sw_coverage_note}\n\n"
+                + self._format_rows(file_rows, [
+                    "file_index", "instrument_code_s", "instrument", "start_time_utc", "end_time_utc",
+                    "qualifying_date", "kp_max", "Ap_daily", "f107_obs", "sunspot_number",
+                ])
+            ))
+
+        count_rows = self._fetch_sql(
+            cte + f"""
+            SELECT COUNT(DISTINCT dm.date_utc) AS matching_days,
+                   MIN(dm.date_utc) AS first_day, MAX(dm.date_utc) AS last_day
+            FROM daily_matches dm
+            JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+            {joined_where_sql}
+            """,
+            tuple(params) + tuple(sw_params),
+        )
+        matching_days = int(count_rows[0][0] or 0) if count_rows else 0
+
+        distinct_file_rows = self._fetch_sql(
+            cte + f"""
+            SELECT COUNT(DISTINCT rd.file_index)
+            FROM recursive_days rd
+            JOIN sw.space_weather_daily sw ON sw.date_utc = rd.day
+            {joined_where_sql}
+            """,
+            tuple(params) + tuple(sw_params),
+        )
+        matching_files = int(distinct_file_rows[0][0] or 0) if distinct_file_rows else 0
+
+        if intent == "count":
+            availability_metric = _availability_metric(query)
+            lead = (
+                f"Matching indexed files: {matching_files}"
+                if availability_metric == "files"
+                else f"Matching distinct UTC days: {matching_days}"
+            )
+            count_details = (
+                f"Matching distinct UTC days: {matching_days}\n"
+                if availability_metric == "files"
+                else f"Matching distinct indexed files: {matching_files}\n"
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_count\n"
+                f"QUERY: {query}\n\n{lead}\n{count_details}"
+                f"Science product: {product_label}\n"
+                f"Matched parameter mnemonics/aliases: {product_codes}\nInstrument scope: {instrument_label}\n"
+                f"Time window: {window['label']}\nSpace-weather filter: {self._space_weather_filter_text(conditions)}\n"
+                f"{sw_coverage_note}\n\n"
+                "Join logic: Madrigal file coverage was expanded to UTC calendar days and joined to GFZ space_weather_daily by date_utc."
+            ))
+
+        if intent == "list_days":
+            rows = self._fetch_sql(
+                cte + f"""
+                SELECT dm.date_utc, dm.file_count, dm.instrument_count,
+                       sw.kp_max, sw.kp_mean, sw.ap_daily, sw.ap_max,
+                       sw.f107_obs, sw.sunspot_number, sw.definitive_flag
+                FROM daily_matches dm
+                JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+                {joined_where_sql}
+                ORDER BY dm.date_utc
+                LIMIT ?
+                """,
+                tuple(params) + tuple(sw_params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_day_list\n"
+                f"QUERY: {query}\n\nTotal matching distinct UTC days: {matching_days}\nScience product: {product_label}\n"
+                f"Instrument scope: {instrument_label}\nSpace-weather filter: {self._space_weather_filter_text(conditions)}\n"
+                f"{sw_coverage_note}\nShowing up to {limit} rows:\n\n"
+                + self._format_rows(rows, [
+                    "date_utc", "file_count", "instrument_count", "kp_max", "kp_mean",
+                    "Ap_daily", "ap_max", "f107_obs", "sunspot_number", "definitive_flag",
+                ])
+            ))
+
+        metric = metric or {"column": "kp_max", "label": "maximum daily Kp", "units": "index"}
+        column = metric["column"]
+        label = metric["label"]
+
+        if intent in {"max", "min"}:
+            direction = "DESC" if intent == "max" else "ASC"
+            extra_predicate = f"sw.{column} IS NOT NULL"
+            predicate = (sw_clause + " AND " + extra_predicate) if sw_clause else extra_predicate
+            rows = self._fetch_sql(
+                cte + f"""
+                SELECT dm.date_utc, dm.file_count, sw.{column} AS requested_value,
+                       sw.ap_daily, sw.f107_obs, sw.sunspot_number, sw.definitive_flag
+                FROM daily_matches dm
+                JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+                WHERE {predicate}
+                ORDER BY sw.{column} {direction}, dm.date_utc
+                LIMIT ?
+                """,
+                tuple(params) + tuple(sw_params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                f"INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_{intent}\nQUERY: {query}\n\n"
+                f"Metric: {label}\nScience product: {product_label}\nInstrument scope: {instrument_label}\n"
+                f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n{sw_coverage_note}\n\n"
+                + self._format_rows(rows, [
+                    "date_utc", "file_count", "requested_value", "Ap_daily", "f107_obs", "sunspot_number", "definitive_flag",
+                ])
+            ))
+
+        if intent == "mean":
+            extra_predicate = f"sw.{column} IS NOT NULL"
+            predicate = (sw_clause + " AND " + extra_predicate) if sw_clause else extra_predicate
+            rows = self._fetch_sql(
+                cte + f"""
+                SELECT COUNT(*), AVG(sw.{column}), MIN(sw.{column}), MAX(sw.{column})
+                FROM daily_matches dm
+                JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+                WHERE {predicate}
+                """,
+                tuple(params) + tuple(sw_params),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_mean\n"
+                f"QUERY: {query}\n\nMetric: {label}\nScience product: {product_label}\nInstrument scope: {instrument_label}\n"
+                f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n{sw_coverage_note}\n\n"
+                + self._format_rows(rows, ["days", "mean", "minimum", "maximum"])
+            ))
+
+        summary = self._fetch_sql(
+            cte + f"""
+            SELECT COUNT(*) AS days,
+                   MIN(sw.kp_max), MAX(sw.kp_max), AVG(sw.kp_max),
+                   MIN(sw.ap_daily), MAX(sw.ap_daily), AVG(sw.ap_daily),
+                   MIN(sw.f107_obs), MAX(sw.f107_obs), AVG(sw.f107_obs)
+            FROM daily_matches dm
+            JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+            {joined_where_sql}
+            """,
+            tuple(params) + tuple(sw_params),
+        )
+        sample = self._fetch_sql(
+            cte + f"""
+            SELECT dm.date_utc, dm.file_count, sw.kp_max, sw.ap_daily,
+                   sw.f107_obs, sw.sunspot_number, sw.definitive_flag
+            FROM daily_matches dm
+            JOIN sw.space_weather_daily sw ON sw.date_utc = dm.date_utc
+            {joined_where_sql}
+            ORDER BY dm.date_utc
+            LIMIT ?
+            """,
+            tuple(params) + tuple(sw_params) + (limit,),
+        )
+        return Message(text=(
+            "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\n"
+            "INTERNAL_ROUTE: HEADERS_SQL\nMODE: madrigal_space_weather_summary\n"
+            f"QUERY: {query}\n\nScience product: {product_label}\nMatched parameter mnemonics/aliases: {product_codes}\n"
+            f"Instrument scope: {instrument_label}\nTime window: {window['label']}\n"
+            f"Space-weather filter: {self._space_weather_filter_text(conditions)}\n{sw_coverage_note}\n\n"
+            "Joined summary:\n"
+            + self._format_rows(summary, [
+                "days", "kp_min", "kp_max", "kp_mean", "Ap_min", "Ap_max", "Ap_mean",
+                "f107_obs_min", "f107_obs_max", "f107_obs_mean",
+            ])
+            + f"\n\nRepresentative joined days (up to {limit}):\n"
+            + self._format_rows(sample, [
+                "date_utc", "file_count", "kp_max", "Ap_daily", "f107_obs", "sunspot_number", "definitive_flag",
+            ])
+            + "\n\nJoin logic: file coverage -> UTC days -> GFZ space_weather_daily on date_utc."
+        ))
+
+    def _run_generic_availability_count(self, query: str, limit: int) -> Optional[Message]:
+        metric = _availability_metric(query)
+        if not metric:
+            return None
+
+        if metric == "measurements":
+            return Message(text=(
+                "[SQL Tool]\nNEEDS_METRIC_CLARIFICATION\n\n"
+                "The local MadVI headers index does not contain individual measurement-record counts. "
+                "It can reliably count either indexed files or distinct covered UTC days.\n\n"
+                "Try one of these:\n"
+                "- How many distinct UTC days of ISR electron density are available in August 2019?\n"
+                "- How many indexed ISR electron-density files are available in August 2019?\n\n"
+                f"QUERY: {query}"
+            ))
+
+        window = _extract_sql_time_window(query)
+        if not window:
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\n"
+                "Reason: an availability count was requested, but no supported time window was found.\n\n"
+                "Supported examples:\n"
+                "- in 2019\n"
+                "- in August 2019\n"
+                "- in 2019-08\n"
+                "- from 2019-08-01 to 2019-08-31\n\n"
+                f"QUERY: {query}"
+            ))
+
+        product = _detect_availability_product(query)
+        product_clause, product_params = self._availability_product_clause(product, "p")
+        instrument_clause, instrument_params, instrument_label = self._availability_instrument_scope(query, "f")
+
+        # A product is optional only when the user explicitly asks for generic ISR/site data.
+        if not product and not instrument_clause:
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\n"
+                "Reason: I detected an availability count, but could not identify a science product, "
+                "parameter mnemonic, instrument family, site, or instrument ID.\n\n"
+                "Examples:\n"
+                "- How many days of ISR drifts are available in 2019?\n"
+                "- How many days of ISR electron density are available in August 2019?\n"
+                "- How many files contain TI for instrument 30 in 2020?\n\n"
+                f"QUERY: {query}"
+            ))
+
+        start = str(window["start"])
+        end = str(window["end"])
+
+        overlap_count = self._fetch_sql(
+            """
+            SELECT COUNT(DISTINCT file_index)
+            FROM files
+            WHERE start_time_utc IS NOT NULL
+              AND COALESCE(end_time_utc, start_time_utc) >= ?
+              AND start_time_utc < ?
+            """,
+            (start, end),
+        )
+        files_in_window = int(overlap_count[0][0] or 0) if overlap_count else 0
+
+        if files_in_window == 0:
+            earliest, latest, available_years = self._db_temporal_coverage_summary()
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\n"
+                "TOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\n"
+                "MODE: generic_science_product_availability_count\n"
+                f"QUERY: {query}\n\n"
+                f"No indexed files overlap the requested window: {window['label']}.\n\n"
+                "Result: not determined from this local metadata index because the requested window "
+                "falls outside its indexed file coverage.\n"
+                "This is not a Madrigal-wide claim that no data exist.\n\n"
+                f"Indexed local time span: {earliest} to {latest}\n"
+                f"Available start years: {available_years}\n\n"
+                "Try a time window inside the indexed range, or refresh the local headers index."
+            ))
+
+        join_parameters = bool(product_clause)
+        cte = """
+            WITH RECURSIVE
+            bounds AS (
+                SELECT ? AS window_start, ? AS window_end
+            ),
+            matching_files AS (
+                SELECT DISTINCT
+                    f.file_index,
+                    f.instrument,
+                    f.instrument_code_s,
+                    DATE(
+                        CASE
+                            WHEN f.start_time_utc < b.window_start THEN b.window_start
+                            ELSE f.start_time_utc
+                        END
+                    ) AS start_day,
+                    DATE(
+                        CASE
+                            WHEN COALESCE(f.end_time_utc, f.start_time_utc) >= b.window_end
+                                THEN strftime('%Y-%m-%dT%H:%M:%S+00:00', b.window_end, '-1 second')
+                            ELSE COALESCE(f.end_time_utc, f.start_time_utc)
+                        END
+                    ) AS end_day,
+                    CASE
+                        WHEN f.start_time_utc < b.window_start THEN b.window_start
+                        ELSE f.start_time_utc
+                    END AS clipped_start_time_utc,
+                    CASE
+                        WHEN COALESCE(f.end_time_utc, f.start_time_utc) >= b.window_end
+                            THEN strftime('%Y-%m-%dT%H:%M:%S+00:00', b.window_end, '-1 second')
+                        ELSE COALESCE(f.end_time_utc, f.start_time_utc)
+                    END AS clipped_end_time_utc
+                FROM files f
+                CROSS JOIN bounds b
+        """
+        if join_parameters:
+            cte += " JOIN parameters p ON p.file_index = f.file_index "
+
+        where = [
+            "f.start_time_utc IS NOT NULL",
+            "f.start_time_utc < b.window_end",
+            "COALESCE(f.end_time_utc, f.start_time_utc) >= b.window_start",
+        ]
+        params: List[object] = [start, end]
+
+        if product_clause:
+            where.append(product_clause)
+            params.extend(product_params)
+
+        if instrument_clause:
+            where.append(instrument_clause)
+            params.extend(instrument_params)
+
+        cte += " WHERE " + " AND ".join(where)
+        cte += """
+            ),
+            recursive_days(
+                file_index,
+                instrument,
+                instrument_code_s,
+                day,
+                end_day
+            ) AS (
+                SELECT
+                    file_index,
+                    instrument,
+                    instrument_code_s,
+                    start_day,
+                    end_day
+                FROM matching_files
+                WHERE start_day IS NOT NULL
+                  AND end_day IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    file_index,
+                    instrument,
+                    instrument_code_s,
+                    DATE(day, '+1 day'),
+                    end_day
+                FROM recursive_days
+                WHERE day < end_day
+            )
+        """
+
+        summary_rows = self._fetch_sql(
+            cte + """
+            SELECT
+                COUNT(DISTINCT mf.file_index) AS file_count,
+                COUNT(DISTINCT rd.day) AS distinct_days,
+                MIN(mf.clipped_start_time_utc) AS first_time_utc,
+                MAX(mf.clipped_end_time_utc) AS last_time_utc
+            FROM matching_files mf
+            LEFT JOIN recursive_days rd ON rd.file_index = mf.file_index
+            """,
+            tuple(params),
+        )
+
+        grouped_rows = self._fetch_sql(
+            cte + """
+            SELECT
+                mf.instrument_code_s,
+                mf.instrument,
+                COUNT(DISTINCT rd.day) AS distinct_days,
+                MIN(mf.clipped_start_time_utc) AS first_time_utc,
+                MAX(mf.clipped_end_time_utc) AS last_time_utc,
+                COUNT(DISTINCT mf.file_index) AS file_count
+            FROM matching_files mf
+            LEFT JOIN recursive_days rd ON rd.file_index = mf.file_index
+            GROUP BY mf.instrument_code_s, mf.instrument
+            ORDER BY distinct_days DESC, file_count DESC
+            LIMIT ?
+            """,
+            tuple(params) + (limit,),
+        )
+
+        file_count = int(summary_rows[0][0] or 0) if summary_rows else 0
+        distinct_days = int(summary_rows[0][1] or 0) if summary_rows else 0
+        first_time = summary_rows[0][2] if summary_rows else None
+        last_time = summary_rows[0][3] if summary_rows else None
+
+        product_label = str(product["label"]) if product else "all indexed data"
+        product_codes = ", ".join(str(x) for x in product.get("codes", [])) if product else "not restricted"
+
+        if file_count == 0:
+            closest = self._closest_availability_windows(
+                product=product,
+                instrument_clause=instrument_clause,
+                instrument_params=instrument_params,
+                limit=min(limit, 8),
+            )
+            closest_txt = self._format_rows(
+                closest,
+                [
+                    "instrument_code_s",
+                    "instrument",
+                    "first_time_utc",
+                    "last_time_utc",
+                    "file_count",
+                ],
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\n"
+                "TOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\n"
+                "MODE: generic_science_product_availability_count\n"
+                f"QUERY: {query}\n\n"
+                f"Local-index result for {window['label']}: 0 matching indexed files and 0 distinct UTC days.\n\n"
+                f"Science product: {product_label}\n"
+                f"Matched parameter mnemonics/aliases: {product_codes}\n"
+                f"Instrument scope: {instrument_label}\n\n"
+                "Closest indexed availability for the same product/scope:\n"
+                f"{closest_txt}\n\n"
+                "Caveat: zero here applies only to the local MadVI headers index. "
+                "It is not a Madrigal-wide absence claim."
+            ))
+
+        lead = (
+            f"Total distinct UTC days with {product_label} availability in {window['label']}: {distinct_days}"
+            if metric == "days"
+            else f"Total indexed files with {product_label} availability in {window['label']}: {file_count}"
+        )
+
+        grouped_txt = self._format_rows(
+            grouped_rows,
+            [
+                "instrument_code_s",
+                "instrument",
+                "distinct_days",
+                "first_time_utc",
+                "last_time_utc",
+                "file_count",
+            ],
+        )
+
+        return Message(text=(
+            "[SQL Tool]\n[SQL Retrieval]\n"
+            "TOOL_NAME: madvi_router_executor_v4\n"
+            "INTERNAL_ROUTE: HEADERS_SQL\n"
+            "MODE: generic_science_product_availability_count\n"
+            f"QUERY: {query}\n\n"
+            f"{lead}\n"
+            f"Total matching indexed files: {file_count}\n"
+            f"Total distinct covered UTC days: {distinct_days}\n"
+            f"First matching time inside requested window: {first_time}\n"
+            f"Last matching time inside requested window: {last_time}\n\n"
+            f"Science product: {product_label}\n"
+            f"Matched parameter mnemonics/aliases: {product_codes}\n"
+            f"Instrument scope: {instrument_label}\n"
+            f"Recognized time window: {window['label']} "
+            f"(inclusive start, exclusive end internally)\n\n"
+            f"Grouped by instrument:\n{grouped_txt}\n\n"
+            "Matching logic:\n"
+            "- files were joined to parameters by file_index when a science product was requested\n"
+            "- file intervals were matched by overlap with the exact requested time window\n"
+            "- covered UTC days were clipped to the requested window and expanded day-by-day\n"
+            "- ISR-family matching includes Millstone Hill IS Radar and its UHF steerable/zenith antenna records\n\n"
+            "Caveat: this answer is based on the local MadVI headers SQLite metadata index, "
+            "not all Madrigal holdings."
+        ))
+
+    def _year_file_count(self, year: str) -> int:
+        rows = self._fetch_sql("SELECT COUNT(*) FROM files WHERE SUBSTR(start_time_utc, 1, 4) = ?", (year,))
+        return rows[0][0] if rows and rows[0] else 0
+
+    def _db_temporal_coverage_summary(self) -> Tuple[str, str, str]:
+        """
+        Returns (earliest_start, latest_start, available_years_text) for user-facing SQL messages.
+        Never exposes local filesystem paths.
+        """
+        try:
+            summary = self._fetch_sql(
+                """
+                SELECT MIN(start_time_utc), MAX(start_time_utc)
+                FROM files
+                WHERE start_time_utc IS NOT NULL
+                """
+            )
+            years = self._fetch_sql(
+                """
+                SELECT SUBSTR(start_time_utc, 1, 4) AS year, COUNT(DISTINCT file_index) AS file_count
+                FROM files
+                WHERE start_time_utc IS NOT NULL
+                GROUP BY SUBSTR(start_time_utc, 1, 4)
+                ORDER BY year
+                """
+            )
+            earliest = summary[0][0] if summary and summary[0] and summary[0][0] else "unknown"
+            latest = summary[0][1] if summary and summary[0] and summary[0][1] else "unknown"
+            if years:
+                year_text = ", ".join(f"{y} ({c} files)" for y, c in years)
+            else:
+                year_text = "none"
+            return earliest, latest, year_text
+        except Exception:
+            return "unknown", "unknown", "unknown"
+
+
+    def _run_parameter_definition_lookup(self, query: str) -> Message:
+        mnemonics = self._extract_mnemonics(query)
+        if not mnemonics:
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\nReason: Parameter definition lookup was requested, but no supported mnemonics were detected.\n\n"
+                "Example: exact parameter definitions and units for gdalt, ti, te, ne\n\n"
+                f"QUERY: {query}"
+            ))
+
+        if not self._table_exists("parameters"):
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\nReason: The SQLite database does not contain the expected parameters table.\n\n"
+                f"Requested mnemonics: {', '.join(mnemonics)}\nQUERY: {query}"
+            ))
+
+        placeholders = ",".join(["?"] * len(mnemonics))
+
+        rows = self._fetch_sql(
+            f"""
+            SELECT
+                UPPER(mnemonic) AS mnemonic,
+                description,
+                COALESCE(
+                    GROUP_CONCAT(DISTINCT CASE WHEN units IS NOT NULL AND TRIM(units) != '' THEN units END),
+                    'None'
+                ) AS units,
+                GROUP_CONCAT(DISTINCT section) AS sections,
+                COUNT(DISTINCT file_index) AS file_count
+            FROM parameters
+            WHERE UPPER(mnemonic) IN ({placeholders})
+            GROUP BY UPPER(mnemonic), description
+            ORDER BY UPPER(mnemonic), description
+            """,
+            tuple(mnemonics),
+        )
+
+        found = {str(r[0]).upper() for r in rows}
+        missing = [m for m in mnemonics if m.upper() not in found]
+
+        txt = self._format_rows(rows, ["mnemonic", "description", "units", "sections", "file_count"])
+
+        extra = ""
+        if missing:
+            extra = (
+                "\n\nMissing requested mnemonics in this local headers DB: " + ", ".join(missing) +
+                "\nNote: this means the mnemonic was not found in the indexed file headers, not necessarily that Madrigal never defines it globally."
+            )
+
+        return Message(text=(
+            "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\n"
+            "MODE: parameter_definition_lookup\nTABLE: parameters\n"
+            f"QUERY: {query}\n\n{txt}{extra}\n\n"
+            "Caveat: parameter code is not present in this local parameters table; file_count indicates how many indexed files contained the mnemonic."
+        ))
+
+    def _run_sql(self, query: str) -> Message:
+        q = _norm(query)
+        limit = _extract_limit(query, self.SQL_DEFAULT_LIMIT)
+        year = _extract_year(query)
+
+        # Space-weather handlers run before legacy parameter-definition logic
+        # because Kp may also appear as a Madrigal header mnemonic.
+        combined_sw = self._run_combined_space_weather_query(query, limit)
+        if combined_sw is not None:
+            return combined_sw
+
+        pure_sw = self._run_space_weather_query(query, limit)
+        if pure_sw is not None:
+            return pure_sw
+
+        if (
+            "parameter definition" in q or "parameter definitions" in q
+            or "definitions and units" in q or "definition and units" in q
+            or "parameter units" in q or "units for" in q or "unit for" in q
+            or "parmcodes" in q or "parmcode" in q or "mnemonic" in q or "mnemonics" in q
+        ):
+            return self._run_parameter_definition_lookup(query)
+
+        if not self._table_exists("files") or not self._table_exists("parameters"):
+            tables = self._fetch_sql("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            return Message(text=(
+                "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\n"
+                "Reason: the local metadata index is not initialized with the expected tables: files and parameters.\n\n"
+                f"Available tables: {', '.join(t[0] for t in tables) if tables else 'none'}\n"
+                "Deployment note: ask the maintainer to verify that the MadVI headers SQLite index is mounted and populated.\n"
+                f"QUERY: {query}"
+            ))
+        # Generic science-product availability counting.
+        # This must run before the generic metadata-index coverage branch.
+        availability_result = self._run_generic_availability_count(query, limit)
+        if availability_result is not None:
+            return availability_result
+
+        # SQL metadata index temporal coverage / latest timestamp
+        if (
+            "start_time_utc" in q
+            or "end_time_utc" in q
+            or "latest start" in q
+            or "earliest start" in q
+            or "latest file" in q
+            or "earliest file" in q
+            or "sql metadata index" in q
+            or "metadata index" in q
+            or "database coverage" in q
+            or "db coverage" in q
+            or "indexed range" in q
+            or "date range of the index" in q
+        ):
+            summary_rows = self._fetch_sql(
+                """
+                SELECT
+                    MIN(start_time_utc) AS earliest_start_time_utc,
+                    MAX(start_time_utc) AS latest_start_time_utc,
+                    MIN(end_time_utc) AS earliest_end_time_utc,
+                    MAX(end_time_utc) AS latest_end_time_utc,
+                    COUNT(DISTINCT file_index) AS file_count
+                FROM files
+                """
+            )
+
+            year_rows = self._fetch_sql(
+                """
+                SELECT
+                    SUBSTR(start_time_utc, 1, 4) AS year,
+                    COUNT(DISTINCT file_index) AS file_count,
+                    MIN(start_time_utc) AS first_start_time_utc,
+                    MAX(end_time_utc) AS last_end_time_utc
+                FROM files
+                WHERE start_time_utc IS NOT NULL
+                GROUP BY SUBSTR(start_time_utc, 1, 4)
+                ORDER BY year
+                """
+            )
+
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\n"
+                "TOOL_NAME: madvi_router_executor_v4\n"
+                "INTERNAL_ROUTE: HEADERS_SQL\n"
+                "MODE: sql_metadata_index_temporal_coverage\n"
+                f"QUERY: {query}\n\n"
+                "Overall index coverage:\n"
+                + self._format_rows(
+                    summary_rows,
+                    [
+                        "earliest_start_time_utc",
+                        "latest_start_time_utc",
+                        "earliest_end_time_utc",
+                        "latest_end_time_utc",
+                        "file_count",
+                    ],
+                )
+                + "\n\nCoverage by start year:\n"
+                + self._format_rows(
+                    year_rows,
+                    ["year", "file_count", "first_start_time_utc", "last_end_time_utc"],
+                )
+                + "\n\nCaveat: this describes only the local MadVI headers SQLite database, not all Madrigal holdings."
+            ))
+
+        # Diagnostics / broad inventory helpers
+        if year and ("show" in q and "files" in q):
+            rows = self._fetch_sql(
+                """
+                SELECT file_index, instrument_code_s, instrument, start_time_utc, end_time_utc, n_data_parameters
+                FROM files
+                WHERE SUBSTR(start_time_utc, 1, 4) = ?
+                ORDER BY start_time_utc
+                LIMIT ?
+                """,
+                (year, limit),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: show_files_by_year\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["file_index", "instrument_code_s", "instrument", "start_time_utc", "end_time_utc", "n_data_parameters"])
+            ))
+
+        if year and ("instruments exist" in q or "instruments in" in q or "which instruments exist" in q or "what instruments exist" in q):
+            rows = self._fetch_sql(
+                """
+                SELECT instrument_code_s, instrument, COUNT(DISTINCT file_index) AS file_count,
+                       MIN(start_time_utc) AS first_time_utc, MAX(end_time_utc) AS last_time_utc
+                FROM files
+                WHERE SUBSTR(start_time_utc, 1, 4) = ?
+                GROUP BY instrument_code_s, instrument
+                ORDER BY file_count DESC
+                LIMIT ?
+                """,
+                (year, limit),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: instruments_by_year\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["instrument_code_s", "instrument", "file_count", "first_time_utc", "last_time_utc"])
+            ))
+
+        if year and ("parameters exist" in q or "parameters in" in q or "which parameters exist" in q or "what parameters exist" in q):
+            rows = self._fetch_sql(
+                """
+                SELECT UPPER(p.mnemonic) AS mnemonic, p.description, COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN p.units IS NOT NULL AND TRIM(p.units) != '' THEN p.units END), 'None') AS units,
+                       COUNT(DISTINCT p.file_index) AS file_count
+                FROM parameters p
+                JOIN files f ON f.file_index = p.file_index
+                WHERE SUBSTR(f.start_time_utc, 1, 4) = ?
+                GROUP BY UPPER(p.mnemonic), p.description
+                ORDER BY file_count DESC
+                LIMIT ?
+                """,
+                (year, limit),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: parameters_by_year\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["mnemonic", "description", "units", "file_count"])
+            ))
+
+
+        # Which instruments contain PARAM [in YEAR]
+        m = re.search(r"which instruments contain (.+?)(?:\s+in\s+(?:19|20)\d{2})?$", q)
+        if m:
+            param = m.group(1).strip()
+            p_clause, p_params = self._param_where_clause(param, "p")
+            year_clause = ""
+            year_params: Tuple[str, ...] = tuple()
+            if year:
+                year_clause = "AND SUBSTR(f.start_time_utc, 1, 4) = ?"
+                year_params = (year,)
+
+            rows = self._fetch_sql(
+                f"""
+                SELECT
+                    f.instrument_code_s,
+                    f.instrument,
+                    COUNT(DISTINCT f.file_index) AS file_count,
+                    MIN(f.start_time_utc) AS first_time_utc,
+                    MAX(f.end_time_utc) AS last_time_utc
+                FROM files f
+                JOIN parameters p ON p.file_index = f.file_index
+                WHERE {p_clause}
+                {year_clause}
+                GROUP BY f.instrument_code_s, f.instrument
+                ORDER BY file_count DESC
+                LIMIT ?
+                """,
+                tuple(p_params) + tuple(year_params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: instrument_parameter_lookup\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["instrument_code_s", "instrument", "file_count", "first_time_utc", "last_time_utc"])
+            ))
+
+        # Which files contain PARAM [in YEAR]
+        m = re.search(r"which files contain (.+?)(?:\s+in\s+(?:19|20)\d{2})?$", q)
+        if m:
+            param = m.group(1).strip()
+            p_clause, p_params = self._param_where_clause(param, "p")
+            year_clause = ""
+            year_params = tuple()
+            if year:
+                year_clause = "AND SUBSTR(f.start_time_utc, 1, 4) = ?"
+                year_params = (year,)
+
+            rows = self._fetch_sql(
+                f"""
+                SELECT f.file_index, f.instrument_code_s, f.instrument, f.start_time_utc, f.end_time_utc
+                FROM files f
+                JOIN parameters p ON p.file_index = f.file_index
+                WHERE {p_clause}
+                {year_clause}
+                GROUP BY f.file_index, f.instrument_code_s, f.instrument, f.start_time_utc, f.end_time_utc
+                ORDER BY f.start_time_utc
+                LIMIT ?
+                """,
+                tuple(p_params) + tuple(year_params) + (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: file_parameter_lookup\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["file_index", "instrument_code_s", "instrument", "start_time_utc", "end_time_utc"])
+            ))
+
+        # Parameter coverage
+        m = re.search(r"(?:parameter coverage|what parameters are available) (?:for|in)?\s*(.+)", q)
+        if m:
+            instrument = m.group(1).strip()
+            rows = self._fetch_sql(
+                """
+                SELECT UPPER(p.mnemonic) AS mnemonic, p.description,
+                       COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN p.units IS NOT NULL AND TRIM(p.units) != '' THEN p.units END), 'None') AS units,
+                       COUNT(DISTINCT p.file_index) AS file_count
+                FROM parameters p
+                JOIN files f ON f.file_index = p.file_index
+                WHERE LOWER(f.instrument) LIKE ? OR LOWER(f.instrument_code_s) LIKE ?
+                GROUP BY UPPER(p.mnemonic), p.description
+                ORDER BY mnemonic
+                LIMIT ?
+                """,
+                (f"%{instrument.lower()}%", f"%{instrument.lower()}%", limit),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: parameter_coverage\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["mnemonic", "description", "units", "file_count"])
+            ))
+
+        # Time coverage
+        m = re.search(r"(?:coverage|years|time coverage).*(?:for|of)\s+(.+)", q)
+        if m:
+            instrument = m.group(1).strip()
+            rows = self._fetch_sql(
+                """
+                SELECT f.instrument_code_s, f.instrument, MIN(f.start_time_utc) AS first_time_utc,
+                       MAX(f.end_time_utc) AS last_time_utc, COUNT(DISTINCT f.file_index) AS file_count
+                FROM files f
+                WHERE LOWER(f.instrument) LIKE ? OR LOWER(f.instrument_code_s) LIKE ?
+                GROUP BY f.instrument_code_s, f.instrument
+                ORDER BY first_time_utc
+                LIMIT ?
+                """,
+                (f"%{instrument.lower()}%", f"%{instrument.lower()}%", limit),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: time_coverage\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["instrument_code_s", "instrument", "first_time_utc", "last_time_utc", "file_count"])
+            ))
+
+        # File index / sample files
+        if "file_index" in q or "file index" in q or "show files" in q:
+            rows = self._fetch_sql(
+                """
+                SELECT file_index, instrument_code_s, instrument, start_time_utc, end_time_utc, n_data_parameters
+                FROM files
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return Message(text=(
+                "[SQL Tool]\n[SQL Retrieval]\nTOOL_NAME: madvi_router_executor_v4\nINTERNAL_ROUTE: HEADERS_SQL\nMODE: file_index_lookup\n"
+                f"QUERY: {query}\n\n" + self._format_rows(rows, ["file_index", "instrument_code_s", "instrument", "start_time_utc", "end_time_utc", "n_data_parameters"])
+            ))
+
+        return Message(text=(
+            "[SQL Tool]\nNO_SUPPORTED_SQL_MODE\n\nReason: Query was routed to SQL, but no supported SQL pattern matched.\n\n"
+            "Supported examples:\n- Which instruments contain electron density?\n- Which instruments contain NEL in 2020?\n- Which files contain TEC?\n"
+            "- What parameters are available for Millstone Hill?\n- What are the exact parameter definitions and units for gdalt, ti, te, ne?\n"
+            "- For how many days is ISR electron density available in August 2019?\n- How many days of ISR drifts are available in 2019?\n- How many indexed files contain TI for instrument 30 in 2020?\n- Show file_index records.\n\n"
+            f"QUERY: {query}"
+        ))
+
+    def run(self) -> Message:
+        try:
+            query = _to_text(self.query).strip()
+            if not query:
+                return Message(text="NO_RESULTS")
+
+            route, reason = self._route(query)
+
+            if route == "OUT_OF_SCOPE":
+                return Message(text=OUT_OF_SCOPE_RESPONSE)
+
+            if route == "MADRIGAL_CITATION":
+                return self._run_citation(query)
+
+            if route == "HEADERS_SQL":
+                return self._run_sql(query)
+
+            api_key = _secret_to_text(self.openai_api_key).strip()
+            if not api_key:
+                return Message(text="ERROR(madvi_router_executor_v4): Missing OpenAI API key")
+
+            if route == "PAPERS":
+                return self._run_papers(query, api_key)
+
+            return self._run_docs(query, api_key)
+
+        except Exception as e:
+            return Message(text=f"ERROR(madvi_router_executor_v4): {type(e).__name__}: {e}")
