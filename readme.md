@@ -1,2 +1,4 @@
 # madvi
-MIT's madvi agent
+MADVI
+
+A conversational interface for Madrigal.
