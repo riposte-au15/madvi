@@ -1,0 +1,1352 @@
+import os
+import re
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from langflow.custom.custom_component.component import Component
+from langflow.io import MessageTextInput, Output
+from langflow.schema.message import Message
+from madrigalWeb.madrigalWeb import MadrigalData
+
+
+DEFAULT_MADRIGAL_URL = "https://cedar.openmadrigal.org/"
+DEFAULT_SQL_DB_PATH = "/home/domo/Langflow311/madrigal_headers.db"
+COMMAND_BUILDER_VERSION = "metadata_aware_v5_tmp_output_directory"
+DEFAULT_OUTPUT_DIR = "/tmp"
+
+
+# ------------------------
+# General helpers
+# ------------------------
+
+def _to_text(x) -> str:
+    if isinstance(x, Message):
+        return x.text or ""
+    return str(x or "")
+
+
+def _clean_space(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _norm(text: str) -> str:
+    return _clean_space(text).lower()
+
+
+def _extract_first_url(s: str) -> str:
+    s = (s or "").strip()
+    m = re.search(r"https?://[^\s\"']+", s)
+    return m.group(0) if m else ""
+
+
+def _normalize_url(url: str) -> str:
+    url = (url or "").strip().strip('"').strip("'")
+    extracted = _extract_first_url(url)
+
+    if extracted:
+        url = extracted
+
+    if not url:
+        url = DEFAULT_MADRIGAL_URL
+
+    url = re.sub(r"(https?://[^/]+)(/.*)?$", r"\1/", url)
+
+    if not url.endswith("/"):
+        url += "/"
+
+    return url
+
+
+def _clean_instrument_name(instr: str) -> str:
+    instr = (instr or "").strip()
+    instr = re.sub(r"\[[^\]]*\]", "", instr)
+    instr = re.sub(r"\s+", " ", instr).strip()
+    return instr
+
+
+def _tokenize(s: str) -> List[str]:
+    s = re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    return [t for t in s.split() if t]
+
+
+def _expand_aliases(tokens: set) -> set:
+    aliases = {
+        "is": ["incoherent", "scatter", "radar"],
+        "iscat": ["incoherent", "scatter", "radar"],
+        "isr": ["incoherent", "scatter", "radar"],
+        "uhf": ["uhf"],
+        "vhf": ["vhf"],
+        "hf": ["hf"],
+        "radar": ["radar"],
+        "tec": ["total", "electron", "content"],
+        "density": ["electron", "density"],
+        "ne": ["electron", "density"],
+        "nel": ["electron", "density"],
+        "temp": ["temperature"],
+        "wind": ["neutral", "wind"],
+        "winds": ["neutral", "wind"],
+        "neutral": ["neutral"],
+        "zonal": ["eastward", "wind"],
+        "meridional": ["northward", "wind"],
+        "vertical": ["up", "wind"],
+    }
+
+    expanded = set(tokens)
+
+    for t in list(tokens):
+        if t in aliases:
+            expanded.update(aliases[t])
+
+    return expanded
+
+
+def _site_style_normalize(name: str) -> str:
+    s = (name or "").lower()
+    s = re.sub(r"\[[^\]]*\]", "", s)
+
+    s = s.replace("incoherent scatter radar", "radar")
+    s = s.replace("incoherent scatter", "")
+    s = s.replace("incoherent", "")
+    s = s.replace("scatter", "")
+    s = s.replace("is radar", "radar")
+    s = re.sub(r"\bis\b", "", s)
+
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _extract_inst(inst) -> Tuple[Optional[int], Optional[str]]:
+    code = getattr(inst, "code", None)
+    name = getattr(inst, "name", None)
+
+    if code is not None and name is not None:
+        try:
+            return int(code), str(name)
+        except Exception:
+            pass
+
+    try:
+        return int(inst[0]), str(inst[1])
+    except Exception:
+        return None, None
+
+
+def _strip_ordinal(s: str) -> str:
+    return re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", (s or ""), flags=re.IGNORECASE)
+
+
+def _parse_date_to_mmddyyyy(s: str) -> str:
+    s = (s or "").strip().strip('"').strip("'")
+
+    if not s:
+        return ""
+
+    s = _strip_ordinal(s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", s):
+        mm, dd, yyyy = s.split("/")
+        return f"{int(mm):02d}/{int(dd):02d}/{int(yyyy):04d}"
+
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+
+    if m:
+        yyyy, mm, dd = m.groups()
+        return f"{int(mm):02d}/{int(dd):02d}/{int(yyyy):04d}"
+
+    for fmt in (
+        "%B %d %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%m/%d/%Y")
+        except Exception:
+            pass
+
+    if re.search(r"\d{5,}", s):
+        return ""
+
+    return ""
+
+
+def _mmddyyyy_to_iso_year(mmddyyyy: str) -> Optional[int]:
+    try:
+        return datetime.strptime(mmddyyyy, "%m/%d/%Y").year
+    except Exception:
+        return None
+
+
+def _safe_shell_quote(s: str) -> str:
+    s = str(s or "")
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _normalize_output_directory(output_raw: str) -> Tuple[str, str]:
+    """
+    Normalize globalIsprint.py --output as a writable DIRECTORY.
+
+    Rules:
+      - If omitted or blank, always use /tmp.
+      - If a filename-like value is supplied without a directory, use /tmp.
+      - If a full file path is supplied, use its parent directory.
+      - If a directory is supplied, preserve it.
+
+    Returns:
+      (normalized_directory, user-facing_note)
+    """
+    raw = str(output_raw or "").strip().strip('"').strip("'")
+
+    if not raw:
+        return (
+            DEFAULT_OUTPUT_DIR,
+            "Output directory defaulted to /tmp because no output directory was specified.",
+        )
+
+    if raw.lower() in {"tmp", "/tmp", "$tmp", "${tmp}"}:
+        return DEFAULT_OUTPUT_DIR, ""
+
+    file_extensions = {
+        ".hdf5", ".h5", ".hdf", ".nc", ".nc4", ".netcdf",
+        ".txt", ".csv", ".dat", ".json", ".zip",
+    }
+
+    normalized_for_split = raw.replace("\\", "/")
+    basename = normalized_for_split.rsplit("/", 1)[-1]
+    suffix = os.path.splitext(basename)[1].lower()
+
+    if suffix in file_extensions:
+        if "/" in normalized_for_split:
+            parent = normalized_for_split.rsplit("/", 1)[0].strip()
+
+            if "\\" in raw and "/" not in raw:
+                parent = parent.replace("/", "\\")
+
+            if parent:
+                return (
+                    parent,
+                    "globalIsprint.py expects a writable directory, so the supplied file path "
+                    f"was normalized to its parent directory: {parent}.",
+                )
+
+        return (
+            DEFAULT_OUTPUT_DIR,
+            "globalIsprint.py expects a writable directory, not a filename. "
+            "The file-like output value was replaced with the default directory /tmp.",
+        )
+
+    return raw, ""
+
+
+def _normalize_format(fmt_in: str) -> str:
+    fmt_in = (fmt_in or "").strip()
+
+    if not fmt_in:
+        return ""
+
+    fmt_map = {
+        "hdf5": "Hdf5",
+        "h5": "Hdf5",
+        "ascii": "ascii",
+        "txt": "ascii",
+        "netcdf4": "netCDF4",
+        "netcdf": "netCDF4",
+        "nc": "netCDF4",
+    }
+
+    return fmt_map.get(fmt_in.lower(), fmt_in)
+
+
+# ------------------------
+# Parameter intent helpers
+# ------------------------
+
+SCIENCE_ALIAS_TO_CODES: Dict[str, List[str]] = {
+    "electron_density": ["NE", "NEL"],
+    "ion_temperature": ["TI"],
+    "electron_temperature": ["TE"],
+    "geodetic_altitude": ["GDALT"],
+    "total_electron_content": ["TEC"],
+    "line_of_sight_velocity": ["VO"],
+    "ion_velocity": ["VI", "VO"],
+    "plasma_frequency": ["POPL"],
+    "neutral_wind": ["VN1", "VN2", "VN31"],
+    "neutral_wind_errors": ["DVN1", "DVN2", "DVN31"],
+    "magnetic_meridional_neutral_wind": ["UMER"],
+}
+
+
+def _detect_science_intents(text: str) -> List[str]:
+    q = _norm(text)
+    intents = []
+
+    if (
+        "electron density" in q
+        or re.search(r"\bne\b", q)
+        or re.search(r"\bnel\b", q)
+        or "density" in q
+    ):
+        intents.append("electron_density")
+
+    if "ion temperature" in q or re.search(r"\bti\b", q):
+        intents.append("ion_temperature")
+
+    if "electron temperature" in q or re.search(r"\bte\b", q):
+        intents.append("electron_temperature")
+
+    if "altitude" in q or "height" in q or re.search(r"\bgdalt\b", q):
+        intents.append("geodetic_altitude")
+
+    if "total electron content" in q or "electron content" in q or re.search(r"\btec\b", q):
+        intents.append("total_electron_content")
+
+    if "line of sight velocity" in q or re.search(r"\bvo\b", q):
+        intents.append("line_of_sight_velocity")
+
+    if "ion velocity" in q or re.search(r"\bvi\b", q):
+        intents.append("ion_velocity")
+
+    if (
+        "neutral wind" in q
+        or "neutral winds" in q
+        or "thermospheric wind" in q
+        or "thermospheric winds" in q
+        or re.search(r"\bvn1\b", q)
+        or re.search(r"\bvn2\b", q)
+        or re.search(r"\bvn31\b", q)
+    ):
+        intents.append("neutral_wind")
+
+    if "zonal wind" in q or "eastward wind" in q:
+        intents.append("neutral_wind")
+
+    if "meridional wind" in q or "northward wind" in q:
+        intents.append("neutral_wind")
+
+    if "vertical wind" in q or "upward wind" in q:
+        intents.append("neutral_wind")
+
+    seen = []
+    for item in intents:
+        if item not in seen:
+            seen.append(item)
+
+    return seen
+
+
+def _looks_like_madrigal_code(token: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_+\-]{0,11}", token or ""))
+
+
+def _normalize_parms_freeform(parms_raw: str) -> Tuple[str, List[str], str]:
+    """
+    Returns:
+      normalized comma-separated parameter codes,
+      science intent labels,
+      warning/status string.
+    """
+    s = (parms_raw or "").strip()
+
+    if not s:
+        return "", [], ""
+
+    intents = _detect_science_intents(s)
+    codes = []
+
+    # Defensive local fallback:
+    # Langflow sometimes caches/evaluates helper functions in a way that can lose
+    # module-level globals after a custom-component edit. This prevents
+    # NameError: SCIENCE_ALIAS_TO_CODES is not defined.
+    alias_to_codes = globals().get(
+        "SCIENCE_ALIAS_TO_CODES",
+        {
+            "electron_density": ["NE", "NEL"],
+            "ion_temperature": ["TI"],
+            "electron_temperature": ["TE"],
+            "geodetic_altitude": ["GDALT"],
+            "total_electron_content": ["TEC"],
+            "line_of_sight_velocity": ["VO"],
+            "ion_velocity": ["VI", "VO"],
+            "plasma_frequency": ["POPL"],
+            "neutral_wind": ["VN1", "VN2", "VN31"],
+            "neutral_wind_errors": ["DVN1", "DVN2", "DVN31"],
+            "magnetic_meridional_neutral_wind": ["UMER"],
+        },
+    )
+
+    for intent in intents:
+        for code in alias_to_codes.get(intent, []):
+            if code not in codes:
+                codes.append(code)
+
+    parts = re.split(r"[,\s]+", s)
+    explicit_codes = []
+
+    for p in parts:
+        p = p.strip().upper()
+        if not p:
+            continue
+        if _looks_like_madrigal_code(p):
+            explicit_codes.append(p)
+
+    prose_words = {
+        "ELECTRON", "DENSITY", "ION", "TEMPERATURE", "TEMP", "TOTAL",
+        "CONTENT", "ALTITUDE", "HEIGHT", "DATA", "PARAMETER", "PARAMETERS",
+        "NEUTRAL", "WIND", "WINDS", "ZONAL", "MERIDIONAL", "VERTICAL",
+        "THERMOSPHERIC", "EASTWARD", "NORTHWARD", "UPWARD",
+    }
+
+    if explicit_codes and not all(p in prose_words for p in explicit_codes):
+        for code in explicit_codes:
+            if code not in codes and code not in prose_words:
+                codes.append(code)
+
+    if not codes:
+        return "__NEEDS_EXACT_MADRIGAL_CODES__", intents, (
+            "Madrigal needs short parameter codes or a recognized science quantity."
+        )
+
+    return ",".join(codes), intents, ""
+
+
+def _codes_from_parms_norm(parms_norm: str) -> List[str]:
+    if not parms_norm or parms_norm.startswith("__"):
+        return []
+    return [p.strip().upper() for p in parms_norm.split(",") if p.strip()]
+
+
+def _pretty_intents(intents: List[str]) -> str:
+    label_map = {
+        "electron_density": "electron density",
+        "ion_temperature": "ion temperature",
+        "electron_temperature": "electron temperature",
+        "geodetic_altitude": "geodetic altitude",
+        "total_electron_content": "total electron content",
+        "line_of_sight_velocity": "line-of-sight velocity",
+        "ion_velocity": "ion velocity",
+        "neutral_wind": "neutral wind",
+        "neutral_wind_errors": "neutral wind errors",
+        "magnetic_meridional_neutral_wind": "magnetic meridional neutral wind",
+    }
+    return ", ".join(label_map.get(x, x) for x in intents)
+
+
+# ------------------------
+# SQLite metadata helpers
+# ------------------------
+
+def _db_usable(db_path: str) -> bool:
+    if not db_path:
+        return False
+    if not os.path.exists(db_path):
+        return False
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('files','parameters')")
+            tables = {r[0] for r in cur.fetchall()}
+            return "files" in tables and "parameters" in tables
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _fetch_sql(db_path: str, sql: str, params: tuple = ()) -> List[tuple]:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _date_year_range(start_mmddyyyy: str, end_mmddyyyy: str) -> Tuple[Optional[int], Optional[int]]:
+    return _mmddyyyy_to_iso_year(start_mmddyyyy), _mmddyyyy_to_iso_year(end_mmddyyyy)
+
+
+def _metadata_year_clause(start_year: Optional[int], end_year: Optional[int]) -> Tuple[str, Tuple]:
+    if start_year is None or end_year is None:
+        return "", tuple()
+
+    y1, y2 = min(start_year, end_year), max(start_year, end_year)
+
+    return (
+        """
+        AND (
+            (f.start_year IS NOT NULL AND f.end_year IS NOT NULL AND f.start_year <= ? AND f.end_year >= ?)
+            OR (
+                f.start_year IS NULL
+                AND SUBSTR(f.start_time_utc, 1, 4) <= ?
+                AND SUBSTR(f.end_time_utc, 1, 4) >= ?
+            )
+        )
+        """,
+        (y2, y1, str(y2), str(y1)),
+    )
+
+
+def _parameter_availability_for_instrument(
+    db_path: str,
+    instrument_id: int,
+    requested_codes: List[str],
+    start_mmddyyyy: str,
+    end_mmddyyyy: str,
+) -> Dict:
+    out = {
+        "matched_codes": [],
+        "available_codes": [],
+        "file_count": 0,
+        "first_time_utc": None,
+        "last_time_utc": None,
+    }
+
+    if not _db_usable(db_path):
+        return out
+
+    if not requested_codes:
+        return out
+
+    start_year, end_year = _date_year_range(start_mmddyyyy, end_mmddyyyy)
+    year_clause, year_params = _metadata_year_clause(start_year, end_year)
+    placeholders = ",".join(["?"] * len(requested_codes))
+
+    rows = _fetch_sql(
+        db_path,
+        f"""
+        SELECT
+            UPPER(p.mnemonic) AS mnemonic,
+            COUNT(DISTINCT f.file_index) AS file_count,
+            MIN(f.start_time_utc) AS first_time_utc,
+            MAX(f.end_time_utc) AS last_time_utc
+        FROM files f
+        JOIN parameters p ON p.file_index = f.file_index
+        WHERE (
+            ',' || REPLACE(f.instrument_code_s, ' ', '') || ',' LIKE ?
+            OR EXISTS (
+                SELECT 1
+                FROM file_instruments fi
+                WHERE fi.file_index = f.file_index
+                AND fi.instrument_code = ?
+            )
+        )
+        AND UPPER(p.mnemonic) IN ({placeholders})
+        {year_clause}
+        GROUP BY UPPER(p.mnemonic)
+        ORDER BY UPPER(p.mnemonic)
+        """,
+        (f"%,{instrument_id},%", instrument_id) + tuple(requested_codes) + tuple(year_params),
+    )
+
+    matched_codes = []
+    file_count_total = 0
+    firsts = []
+    lasts = []
+
+    for mnemonic, file_count, first_time, last_time in rows:
+        if mnemonic:
+            matched_codes.append(str(mnemonic).upper())
+        file_count_total += int(file_count or 0)
+        if first_time:
+            firsts.append(first_time)
+        if last_time:
+            lasts.append(last_time)
+
+    out["matched_codes"] = sorted(set(matched_codes))
+    out["available_codes"] = sorted(set(matched_codes))
+    out["file_count"] = file_count_total
+    out["first_time_utc"] = min(firsts) if firsts else None
+    out["last_time_utc"] = max(lasts) if lasts else None
+
+    return out
+
+
+def _db_global_param_presence(db_path: str, requested_codes: List[str]) -> Dict[str, int]:
+    if not _db_usable(db_path) or not requested_codes:
+        return {}
+
+    placeholders = ",".join(["?"] * len(requested_codes))
+
+    rows = _fetch_sql(
+        db_path,
+        f"""
+        SELECT UPPER(mnemonic), COUNT(DISTINCT file_index)
+        FROM parameters
+        WHERE UPPER(mnemonic) IN ({placeholders})
+        GROUP BY UPPER(mnemonic)
+        """,
+        tuple(requested_codes),
+    )
+
+    return {str(k).upper(): int(v or 0) for k, v in rows}
+
+
+def _db_coverage_summary(db_path: str) -> str:
+    if not _db_usable(db_path):
+        return "local metadata index unavailable"
+
+    try:
+        rows = _fetch_sql(
+            db_path,
+            """
+            SELECT MIN(start_time_utc), MAX(start_time_utc), COUNT(DISTINCT file_index)
+            FROM files
+            """
+        )
+        if not rows:
+            return "local metadata index has no files"
+
+        earliest, latest, count = rows[0]
+        return f"{earliest} to {latest} ({count} indexed files)"
+    except Exception:
+        return "local metadata index coverage unavailable"
+
+
+def _site_like_clause_from_instrument_text(instrument_text: str) -> Tuple[str, Tuple[str, ...]]:
+    """Build a safe SQL site/instrument filter from a user instrument phrase.
+
+    It intentionally focuses on strong site tokens such as "millstone" and "hill".
+    If no useful token is available, it returns a broad true clause.
+    """
+    tokens = [t for t in _tokenize(instrument_text) if len(t) >= 3]
+    stop = {
+        "the", "and", "for", "data", "instrument", "radar", "isr", "incoherent",
+        "scatter", "measurements", "measurement", "neutral", "electron", "density",
+        "temperature", "wind", "winds", "ion", "uhf", "vhf", "hdf5", "ascii",
+    }
+    useful = [t for t in tokens if t not in stop]
+
+    # Prefer site names when present.
+    if "millstone" in tokens:
+        useful = ["millstone"]
+    elif "poker" in tokens and "flat" in tokens:
+        useful = ["poker", "flat"]
+    elif "jicamarca" in tokens:
+        useful = ["jicamarca"]
+    elif "arecibo" in tokens:
+        useful = ["arecibo"]
+    elif "sondrestrom" in tokens or "sondrestromfjord" in tokens:
+        useful = ["sondrestrom"]
+
+    if not useful:
+        return "1=1", tuple()
+
+    parts = []
+    params = []
+    for tok in useful[:3]:
+        parts.append("LOWER(f.instrument) LIKE ?")
+        params.append(f"%{tok}%")
+
+    return " AND ".join(parts), tuple(params)
+
+
+def _site_parameter_matches(
+    db_path: str,
+    instrument_text: str,
+    requested_codes: List[str],
+    start_mmddyyyy: str,
+    end_mmddyyyy: str,
+    limit: int = 12,
+) -> List[Dict]:
+    """Return instruments at the requested site that contain requested codes in the date/year window."""
+    if not _db_usable(db_path) or not requested_codes:
+        return []
+
+    start_year, end_year = _date_year_range(start_mmddyyyy, end_mmddyyyy)
+    year_clause, year_params = _metadata_year_clause(start_year, end_year)
+    site_clause, site_params = _site_like_clause_from_instrument_text(instrument_text)
+    placeholders = ",".join(["?"] * len(requested_codes))
+
+    rows = _fetch_sql(
+        db_path,
+        f"""
+        SELECT
+            f.instrument_code_s,
+            f.instrument,
+            GROUP_CONCAT(DISTINCT UPPER(p.mnemonic)) AS matched_codes,
+            COUNT(DISTINCT f.file_index) AS file_count,
+            MIN(f.start_time_utc) AS first_time_utc,
+            MAX(f.end_time_utc) AS last_time_utc
+        FROM files f
+        JOIN parameters p ON p.file_index = f.file_index
+        WHERE {site_clause}
+        AND UPPER(p.mnemonic) IN ({placeholders})
+        {year_clause}
+        GROUP BY f.instrument_code_s, f.instrument
+        ORDER BY file_count DESC, f.instrument
+        LIMIT ?
+        """,
+        tuple(site_params) + tuple(requested_codes) + tuple(year_params) + (limit,),
+    )
+
+    out = []
+    for code_s, instrument, codes, file_count, first_time, last_time in rows:
+        out.append({
+            "instrument_code_s": code_s,
+            "instrument": instrument,
+            "matched_codes": sorted(set(str(codes or "").split(","))) if codes else [],
+            "file_count": int(file_count or 0),
+            "first_time_utc": first_time,
+            "last_time_utc": last_time,
+        })
+    return out
+
+
+def _site_parameter_historical_matches(
+    db_path: str,
+    instrument_text: str,
+    requested_codes: List[str],
+    limit: int = 12,
+) -> List[Dict]:
+    """Return historical site instruments containing requested codes, ignoring requested date."""
+    if not _db_usable(db_path) or not requested_codes:
+        return []
+
+    site_clause, site_params = _site_like_clause_from_instrument_text(instrument_text)
+    placeholders = ",".join(["?"] * len(requested_codes))
+
+    rows = _fetch_sql(
+        db_path,
+        f"""
+        SELECT
+            f.instrument_code_s,
+            f.instrument,
+            GROUP_CONCAT(DISTINCT UPPER(p.mnemonic)) AS matched_codes,
+            COUNT(DISTINCT f.file_index) AS file_count,
+            MIN(f.start_time_utc) AS first_time_utc,
+            MAX(f.end_time_utc) AS last_time_utc
+        FROM files f
+        JOIN parameters p ON p.file_index = f.file_index
+        WHERE {site_clause}
+        AND UPPER(p.mnemonic) IN ({placeholders})
+        GROUP BY f.instrument_code_s, f.instrument
+        ORDER BY file_count DESC, f.instrument
+        LIMIT ?
+        """,
+        tuple(site_params) + tuple(requested_codes) + (limit,),
+    )
+
+    out = []
+    for code_s, instrument, codes, file_count, first_time, last_time in rows:
+        out.append({
+            "instrument_code_s": code_s,
+            "instrument": instrument,
+            "matched_codes": sorted(set(str(codes or "").split(","))) if codes else [],
+            "file_count": int(file_count or 0),
+            "first_time_utc": first_time,
+            "last_time_utc": last_time,
+        })
+    return out
+
+
+def _parse_single_numeric_instrument_code(code_s: str) -> Optional[int]:
+    if not code_s:
+        return None
+    parts = [p.strip() for p in str(code_s).split(",") if p.strip()]
+    if len(parts) != 1:
+        return None
+    return int(parts[0]) if parts[0].isdigit() else None
+
+
+def _is_neutral_wind_request(science_intents: List[str], requested_codes: List[str]) -> bool:
+    return "neutral_wind" in science_intents or any(c in {"VN1", "VN2", "VN31", "UMER"} for c in requested_codes)
+
+
+# ------------------------
+# Component
+# ------------------------
+
+class MadrigalCommandBuilder5(Component):
+    display_name = "Madrigal Command Builder v5"
+    description = (
+        "Builds globalIsprint.py commands with metadata-aware instrument resolution. "
+        "Uses local MadVI headers DB to avoid recommending instruments that do not contain requested parameters."
+    )
+    icon = "terminal"
+    name = "MadrigalCommandBuilder"
+    trace_type = "tool"
+
+    inputs = [
+        MessageTextInput(name="url", display_name="Madrigal URL", tool_mode=True),
+        MessageTextInput(name="instrument", display_name="Instrument (name or id)", tool_mode=True),
+        MessageTextInput(name="parms", display_name="Parms or science quantity", tool_mode=True),
+        MessageTextInput(name="startDate", display_name="Start Date", tool_mode=True),
+        MessageTextInput(name="endDate", display_name="End Date", tool_mode=True),
+        MessageTextInput(name="format", display_name="Format (Hdf5|ascii|netCDF4)", tool_mode=True),
+        MessageTextInput(name="output_path", display_name="Output directory (default /tmp)", tool_mode=True),
+        MessageTextInput(name="user_fullname", display_name="User full name", tool_mode=True),
+        MessageTextInput(name="user_email", display_name="User email", tool_mode=True),
+        MessageTextInput(name="user_affiliation", display_name="User affiliation", tool_mode=True),
+        MessageTextInput(name="sql_db_path", display_name="SQL DB Path optional", tool_mode=True),
+        MessageTextInput(name="skip_optional", display_name="Skip optional info? (true/false)", tool_mode=True),
+        MessageTextInput(name="debug", display_name="Debug (true/false)", tool_mode=True),
+    ]
+
+    outputs = [
+        Output(display_name="Command", name="command", method="build_command"),
+    ]
+
+    def _get_sql_db_path(self) -> str:
+        custom = _to_text(getattr(self, "sql_db_path", "")).strip()
+        return custom or DEFAULT_SQL_DB_PATH
+
+    def _score_madrigal_candidate(
+        self,
+        instrument_query: str,
+        instrument_id: int,
+        instrument_name: str,
+        requested_codes: List[str],
+        science_intents: List[str],
+        startDate: str,
+        endDate: str,
+        db_path: str,
+    ) -> Dict:
+        q = _norm(instrument_query)
+        q_tokens = _expand_aliases(set(_tokenize(instrument_query)))
+        q_norm = _site_style_normalize(instrument_query)
+
+        name_l = _norm(instrument_name)
+        name_tokens = set(_tokenize(instrument_name))
+
+        explicit_isr = (
+            "isr" in q
+            or "is radar" in q
+            or "incoherent scatter radar" in q
+            or "incoherent scatter" in q
+            or "isradar" in q.replace(" ", "")
+        )
+
+        requested_density_or_temp = any(
+            x in science_intents
+            for x in ["electron_density", "ion_temperature", "electron_temperature"]
+        ) or any(c in requested_codes for c in ["NE", "NEL", "TI", "TE"])
+
+        requested_neutral_wind = _is_neutral_wind_request(science_intents, requested_codes)
+
+        score = 0
+        reasons = []
+
+        overlap = q_tokens.intersection(name_tokens)
+
+        if overlap:
+            score += 220 + 45 * len(overlap)
+            reasons.append(f"name overlap: {', '.join(sorted(overlap))}")
+
+        if q and q in name_l:
+            score += 350
+            reasons.append("direct name substring")
+
+        if q_norm and q_norm in name_l:
+            score += 300
+            reasons.append("normalized name substring")
+
+        if "millstone" in q_tokens and "hill" in q_tokens and "millstone hill" in name_l:
+            score += 500
+            reasons.append("Millstone Hill site match")
+
+        if explicit_isr and "is radar" in name_l:
+            score += 4000
+            reasons.append("explicit ISR/IS Radar match")
+
+        if (
+            requested_density_or_temp
+            and "millstone" in q_tokens
+            and "hill" in q_tokens
+            and "millstone hill is radar" in name_l
+        ):
+            score += 3500
+            reasons.append("density/temperature request at Millstone Hill strongly favors IS Radar")
+
+        if "fabry" in name_l and requested_density_or_temp:
+            score -= 2500
+            reasons.append("Fabry-Perot deprioritized for electron-density/ISR temperature request")
+
+        if "all-sky" in name_l and requested_density_or_temp:
+            score -= 2500
+            reasons.append("All-Sky Imager deprioritized for electron-density/ISR temperature request")
+
+        if requested_neutral_wind and ("fabry" in name_l or "fpi" in name_l):
+            score += 1800
+            reasons.append("neutral wind request favors Fabry-Perot/FPI instruments when metadata supports them")
+
+        if requested_neutral_wind and ("all-sky" in name_l or "imager" in name_l):
+            score -= 2200
+            reasons.append("All-Sky Imager deprioritized for neutral wind request")
+
+        meta = _parameter_availability_for_instrument(
+            db_path=db_path,
+            instrument_id=instrument_id,
+            requested_codes=requested_codes,
+            start_mmddyyyy=startDate,
+            end_mmddyyyy=endDate,
+        )
+
+        matched_codes = meta.get("matched_codes", [])
+        file_count = meta.get("file_count", 0)
+
+        if requested_codes and matched_codes:
+            score += 2500 + 350 * len(matched_codes)
+            score += min(file_count, 500)
+            reasons.append(f"metadata contains requested codes: {', '.join(matched_codes)}")
+
+        if requested_codes and not matched_codes and _db_usable(db_path):
+            score -= 1800
+            reasons.append("no requested parameter codes found for this instrument/date window in local metadata")
+
+        return {
+            "score": score,
+            "id": instrument_id,
+            "name": instrument_name,
+            "metadata": meta,
+            "reasons": reasons,
+        }
+
+    def _resolve_instrument_metadata_aware(
+        self,
+        url: str,
+        instrument_clean: str,
+        requested_codes: List[str],
+        science_intents: List[str],
+        startDate: str,
+        endDate: str,
+        db_path: str,
+    ) -> Tuple[Optional[int], List[Dict], str]:
+        if instrument_clean.isdigit():
+            return int(instrument_clean), [], ""
+
+        md = MadrigalData(url)
+        inst_list = md.getAllInstruments()
+
+        scored = []
+
+        for inst in inst_list:
+            inst_id, name = _extract_inst(inst)
+
+            if inst_id is None or not name:
+                continue
+
+            cand = self._score_madrigal_candidate(
+                instrument_query=instrument_clean,
+                instrument_id=inst_id,
+                instrument_name=name,
+                requested_codes=requested_codes,
+                science_intents=science_intents,
+                startDate=startDate,
+                endDate=endDate,
+                db_path=db_path,
+            )
+
+            if cand["score"] > 0:
+                scored.append(cand)
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        if not scored:
+            return None, [], (
+                f"I couldn't resolve the instrument '{instrument_clean}' at {url}.\n"
+                "Reply with a numeric inst id, e.g. 30, or a more specific instrument name."
+            )
+
+        top = scored[0]
+        second = scored[1] if len(scored) > 1 else None
+
+        supported = [
+            c for c in scored
+            if c.get("metadata", {}).get("matched_codes")
+        ]
+
+        if requested_codes and len(supported) == 1:
+            return supported[0]["id"], scored[:10], ""
+
+        if not second or (top["score"] - second["score"]) >= 700:
+            return top["id"], scored[:10], ""
+
+        top_has_meta = bool(top.get("metadata", {}).get("matched_codes"))
+        second_has_meta = bool(second.get("metadata", {}).get("matched_codes"))
+
+        if top_has_meta and not second_has_meta:
+            return top["id"], scored[:10], ""
+
+        candidates_to_show = supported[:8] if supported else scored[:8]
+
+        lines = [
+            f"Your instrument name is ambiguous: '{instrument_clean}'",
+            "",
+        ]
+
+        if requested_codes and supported:
+            lines.append(
+                "I filtered candidates using the requested parameter codes "
+                f"({', '.join(requested_codes)}) and the local metadata index."
+            )
+        elif requested_codes and not supported:
+            lines.append(
+                "I could not confirm parameter availability for the candidates in the local metadata index, "
+                "so I need a numeric instrument ID."
+            )
+
+        lines.append("")
+        lines.append("Candidate instruments:")
+
+        for c in candidates_to_show:
+            meta = c.get("metadata", {})
+            codes = meta.get("matched_codes") or []
+            file_count = meta.get("file_count") or 0
+            code_note = f"contains {', '.join(codes)}; {file_count} matching indexed files" if codes else "parameter support not confirmed"
+            lines.append(f"- {c['id']} — {c['name']} ({code_note})")
+
+        excluded = [
+            c for c in scored[:12]
+            if requested_codes and not c.get("metadata", {}).get("matched_codes")
+            and ("fabry" in c["name"].lower() or "all-sky" in c["name"].lower())
+        ]
+
+        if excluded:
+            lines.append("")
+            lines.append("Excluded from recommendation because they do not match the requested data product in the local metadata index:")
+            for c in excluded[:5]:
+                lines.append(f"- {c['id']} — {c['name']}")
+
+        lines.append("")
+        lines.append("Reply with the numeric instrument ID you want.")
+
+        return None, scored[:10], "\n".join(lines)
+
+    async def build_command(self) -> Message:
+        url_raw = _to_text(self.url).strip()
+        url = _normalize_url(url_raw)
+
+        instrument_raw = _to_text(self.instrument).strip()
+        instrument_clean = _clean_instrument_name(instrument_raw)
+
+        parms_raw = _to_text(self.parms).strip()
+        parms_norm, science_intents, parms_warning = _normalize_parms_freeform(parms_raw)
+        requested_codes = _codes_from_parms_norm(parms_norm)
+
+        start_raw = _to_text(self.startDate).strip()
+        end_raw = _to_text(self.endDate).strip()
+        startDate = _parse_date_to_mmddyyyy(start_raw)
+        endDate = _parse_date_to_mmddyyyy(end_raw)
+
+        fmt_raw = _to_text(self.format).strip()
+        fmt = _normalize_format(fmt_raw)
+
+        output_path_raw = _to_text(self.output_path).strip()
+        output_path, output_path_note = _normalize_output_directory(output_path_raw)
+
+        user_fullname = (_to_text(self.user_fullname).strip() or "")
+        user_email_raw = (_to_text(self.user_email).strip() or "")
+        m_email = re.search(r"[\w\.\-+]+@[\w\.\-]+\.\w+", user_email_raw)
+        user_email = (m_email.group(0) if m_email else "")
+        user_affiliation = (_to_text(self.user_affiliation).strip() or "")
+
+        skip_optional = (_to_text(self.skip_optional).strip().lower() == "true")
+        debug = (_to_text(self.debug).strip().lower() == "true")
+        db_path = self._get_sql_db_path()
+
+        if not instrument_clean:
+            return Message(
+                text=(
+                    "Which Madrigal instrument should I use?\n"
+                    "Example: Millstone Hill IS Radar, Millstone Hill ISR, or instrument 30."
+                )
+            )
+
+        if (start_raw and not startDate) or (end_raw and not endDate):
+            return Message(
+                text=(
+                    "I couldn't parse your date range.\n"
+                    "Use either:\n"
+                    "- 2025-01-01 to 2025-01-31\n"
+                    "- January 1 2025 to January 31 2025\n"
+                    "- 01/01/2025 to 01/31/2025"
+                )
+            )
+
+        if not startDate or not endDate:
+            return Message(text="What date range do you want? Example: 2025-01-01 to 2025-01-31.")
+
+        if not fmt:
+            return Message(text="Which output format do you want? Reply with: HDF5, ASCII, or netCDF4.")
+
+        if not parms_norm:
+            return Message(
+                text=(
+                    "What data product or Madrigal parameter codes do you want?\n"
+                    "Examples:\n"
+                    "- electron density\n"
+                    "- gdalt,ne,ti,te\n"
+                    "- TEC"
+                )
+            )
+
+        if parms_norm == "__NEEDS_EXACT_MADRIGAL_CODES__":
+            return Message(
+                text=(
+                    "I could not safely map that data product to Madrigal parameter codes.\n"
+                    "Try a recognized quantity such as electron density, ion temperature, electron temperature, altitude, or TEC.\n"
+                    "Or provide exact Madrigal parameter codes, comma-separated."
+                )
+            )
+
+        if not skip_optional:
+            missing = []
+
+            if not user_fullname:
+                missing.append("full name")
+            if not user_email:
+                missing.append("email")
+            if not user_affiliation:
+                missing.append("affiliation")
+
+            if missing:
+                return Message(
+                    text=(
+                        "Before I generate the runnable command, do you want to include optional user info?\n"
+                        f"Missing: {', '.join(missing)}\n\n"
+                        "You can reply with any of these:\n"
+                        "- name: Your Name\n"
+                        "- email: you@domain.com\n"
+                        "- affiliation: Your Org\n"
+                        "- output directory: /your/writable/directory (optional; default /tmp)\n\n"
+                        "Or reply: skip"
+                    )
+                )
+
+        # Deployment-safe defaults. Never inherit previous users.
+        if not user_fullname:
+            user_fullname = "Unknown User"
+        if not user_email:
+            user_email = "unknown@example.com"
+        if not user_affiliation:
+            user_affiliation = "None"
+
+        param_presence = _db_global_param_presence(db_path, requested_codes)
+
+        missing_requested_codes = [
+            code for code in requested_codes
+            if _db_usable(db_path) and param_presence.get(code, 0) == 0
+        ]
+
+        # Metadata-aware guardrail for beginner users:
+        # If a recognized data product has no matching files for the requested site/date,
+        # do not fabricate a command that is likely to return empty data.
+        if _db_usable(db_path) and requested_codes:
+            site_matches_now = _site_parameter_matches(
+                db_path=db_path,
+                instrument_text=instrument_clean,
+                requested_codes=requested_codes,
+                start_mmddyyyy=startDate,
+                end_mmddyyyy=endDate,
+                limit=8,
+            )
+
+            if not site_matches_now and science_intents:
+                historical = _site_parameter_historical_matches(
+                    db_path=db_path,
+                    instrument_text=instrument_clean,
+                    requested_codes=requested_codes,
+                    limit=8,
+                )
+
+                lines = [
+                    "[Command]",
+                    "I recognized the requested data product, but the local MadVI metadata index did not confirm any matching files for that site/date window.",
+                    "",
+                    f"Detected data product intent: {_pretty_intents(science_intents)}.",
+                    f"Mapped Madrigal parameter codes: {', '.join(requested_codes)}.",
+                    f"Requested instrument/site: {instrument_clean}",
+                    f"Requested date range: {startDate} to {endDate}",
+                    "",
+                    "I will not fabricate a globalIsprint.py command that is likely to return empty data.",
+                ]
+
+                if historical:
+                    lines.append("")
+                    lines.append("Closest matching availability for this site/data product in the local index:")
+                    for h in historical[:6]:
+                        lines.append(
+                            f"- {h['instrument_code_s']} — {h['instrument']} "
+                            f"contains {', '.join(h['matched_codes'])}; "
+                            f"{h['file_count']} indexed files; "
+                            f"{h['first_time_utc']} to {h['last_time_utc']}"
+                        )
+                    lines.append("")
+                    lines.append("Try a date range inside one of those availability windows, or provide a numeric instrument ID if you intentionally want to force the command.")
+                else:
+                    lines.append("")
+                    lines.append("No historical match for those parameter codes was found at that site in the local index.")
+                    lines.append("Try exact Madrigal parameter codes, a broader site/instrument name, or a different date range.")
+
+                return Message(text="\n".join(lines))
+
+        try:
+            inst_id, inst_debug, blocked_message = self._resolve_instrument_metadata_aware(
+                url=url,
+                instrument_clean=instrument_clean,
+                requested_codes=requested_codes,
+                science_intents=science_intents,
+                startDate=startDate,
+                endDate=endDate,
+                db_path=db_path,
+            )
+
+            if blocked_message:
+                return Message(text=blocked_message)
+
+            if inst_id is None:
+                return Message(
+                    text=(
+                        f"I couldn't resolve the instrument '{instrument_raw}'.\n"
+                        "Reply with a numeric instrument ID, e.g. 30."
+                    )
+                )
+
+        except Exception as e:
+            return Message(
+                text=(
+                    "I hit an error while resolving the instrument.\n"
+                    f"Site: {url}\n"
+                    f"Error: {type(e).__name__}: {e}\n"
+                    "Try again, or reply with a numeric instrument ID."
+                )
+            )
+
+        parms_part = f" --parms={parms_norm}" if parms_norm else ""
+
+        cmd = (
+            "globalIsprint.py --verbose "
+            f"--url={url}"
+            f"{parms_part} "
+            f"--output={_safe_shell_quote(output_path)} "
+            f"--user_fullname={_safe_shell_quote(user_fullname)} "
+            f"--user_email={_safe_shell_quote(user_email)} "
+            f"--user_affiliation={_safe_shell_quote(user_affiliation)} "
+            f'--startDate="{startDate}" --endDate="{endDate}" '
+            f"--inst={inst_id} --format={fmt}"
+        )
+
+        notes = []
+
+        if output_path_note:
+            notes.append(output_path_note)
+
+        if science_intents:
+            notes.append(
+                "Detected data product intent: "
+                f"{_pretty_intents(science_intents)}."
+            )
+
+        if requested_codes:
+            notes.append(f"Using Madrigal parameter codes: {parms_norm}.")
+
+        if missing_requested_codes:
+            notes.append(
+                "Warning: the local MadVI metadata index did not contain these requested codes anywhere: "
+                + ", ".join(missing_requested_codes)
+                + ". They are kept in the command because the user explicitly requested them, "
+                "but Madrigal may return no values for those parameters for this instrument/date range."
+            )
+
+        chosen_meta = _parameter_availability_for_instrument(
+            db_path=db_path,
+            instrument_id=inst_id,
+            requested_codes=requested_codes,
+            start_mmddyyyy=startDate,
+            end_mmddyyyy=endDate,
+        )
+
+        if chosen_meta.get("matched_codes"):
+            notes.append(
+                "Local metadata check: selected instrument has indexed files containing "
+                f"{', '.join(chosen_meta['matched_codes'])} "
+                f"for the requested time window "
+                f"({chosen_meta.get('file_count', 0)} matching indexed files)."
+            )
+        elif _db_usable(db_path) and requested_codes:
+            notes.append(
+                "Local metadata check: no indexed files confirmed the requested parameter codes "
+                "for this instrument/date window. The command is still generated, but verify the returned file."
+            )
+
+        if inst_debug:
+            top = inst_debug[0]
+            excluded_bad = [
+                c for c in inst_debug
+                if requested_codes
+                and not c.get("metadata", {}).get("matched_codes")
+                and ("fabry" in c["name"].lower() or "all-sky" in c["name"].lower())
+            ]
+
+            notes.append(f"Resolved instrument: {top['id']} — {top['name']}.")
+
+            if excluded_bad:
+                notes.append(
+                    "Not recommended for this data product: "
+                    + "; ".join(f"{c['id']} — {c['name']}" for c in excluded_bad[:3])
+                    + "."
+                )
+
+        if not _db_usable(db_path):
+            notes.append(
+                "Local metadata index was unavailable, so instrument resolution used Madrigal site names only."
+            )
+
+        response = (
+            "[Command]\n"
+            "Runnable globalIsprint.py command:\n\n"
+            "```bash\n"
+            f"{cmd}\n"
+            "```"
+        )
+
+        if notes:
+            response += "\n\n" + "\n".join(f"- {n}" for n in notes)
+
+        if debug:
+            dbg = [
+                "",
+                "DEBUG:",
+                f"  url_raw: {url_raw}",
+                f"  url_normalized: {url}",
+                f"  db_usable: {_db_usable(db_path)}",
+                f"  db_coverage: {_db_coverage_summary(db_path)}",
+                f"  instrument_raw: {instrument_raw}",
+                f"  instrument_clean: {instrument_clean}",
+                f"  resolved_inst_id: {inst_id}",
+                f"  parms_raw: {parms_raw}",
+                f"  parms_normalized: {parms_norm}",
+                f"  science_intents: {science_intents}",
+                f"  requested_codes: {requested_codes}",
+                f"  start_raw: {start_raw}",
+                f"  end_raw: {end_raw}",
+                f"  startDate_mmddyyyy: {startDate}",
+                f"  endDate_mmddyyyy: {endDate}",
+                f"  format_raw: {fmt_raw}",
+                f"  format_norm: {fmt}",
+                f"  output_path_raw: {output_path_raw}",
+                f"  output_directory_normalized: {output_path}",
+                f"  output_path_note: {output_path_note}",
+                f"  skip_optional: {skip_optional}",
+                "  top_candidates:",
+            ]
+
+            for c in inst_debug[:10]:
+                meta = c.get("metadata", {})
+                dbg.append(
+                    f"    score={c['score']} id={c['id']} name={c['name']} "
+                    f"matched_codes={meta.get('matched_codes')} file_count={meta.get('file_count')} "
+                    f"reasons={'; '.join(c.get('reasons', []))}"
+                )
+
+            response += "\n\n```text\n" + "\n".join(dbg) + "\n```"
+
+        self.status = response
+        return Message(text=response)
